@@ -1,0 +1,22 @@
+# --- Vercel deploy ignore ---
+# Local build outputs — rebuilt on Vercel during `npm run build`
+node_modules
+dist
+
+# Environment files — never upload secrets.
+# Add VITE_* vars in the Vercel dashboard (Project → Settings → Environment Variables)
+.env
+.env.*
+!.env.example
+
+# Project docs / audit artifacts — not needed at runtime
+chat.md
+solve.md
+problem.yaml
+protocol.md
+AUDIT_FIXES_SESSION.md
+PROBLEMS.md
+backend
+supabase
+firestore.indexes.json
+scripts
