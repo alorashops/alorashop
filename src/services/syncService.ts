@@ -115,12 +115,41 @@ export async function pullDelta(): Promise<void> {
 /** Apply cloud rows locally; returns only the changes that were actually written. */
 async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[]> {
   const applied: PulledChange[] = [];
+
+  // Strip sync-accounting metadata that must never be part of a canonical
+  // local domain doc. buildCloudRows() injects `__idempotency_key` into the
+  // cloud `data`, and VOID docs carry a `__void_of` wrapper — if these leak
+  // back into local rows (or re-push), the stored document drifts away from the
+  // real Sales/Product shape and every subsequent mirror pollutes itself.
+  // (Finding 4.)
+  const clean = (raw: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (k.startsWith('__')) continue; // drop idempotency key + void wrapper
+      out[k] = v;
+    }
+    return out;
+  };
+
   for (const change of changes) {
-    const payload = change.payload as Record<string, unknown> & { id?: string };
-    if (!payload?.id) continue; // malformed row — leave above cursor for retry
+    const raw = change.payload as Record<string, unknown> & { id?: string; productId?: string };
+    // Costing docs are keyed by `productId`, everything else by `id`.
+    if (!raw?.id && !raw?.productId) continue; // malformed row — leave above cursor for retry
+
+    const payload = clean(raw);
+    // VOID folds its `__void_of` marker into the canonical SALE `voidedBy`
+    // reference (the local row already uses `voidedBy` for that link).
+    if (change.entityType === 'VOID') {
+      const vo = (raw.__void_of ?? {}) as { originalId?: unknown };
+      if (vo?.originalId) payload.voidedBy = String(vo.originalId);
+    }
+
     switch (change.entityType) {
       case 'PRODUCT':
         await db.products.put(payload as never);
+        break;
+      case 'PRODUCT_COSTING':
+        await db.productCosting.put(payload as never);
         break;
       case 'SALE':
       case 'VOID':

@@ -19,6 +19,7 @@ export type OutboxEntity =
   | 'RESTOCK'
   | 'VOID'
   | 'PRODUCT'
+  | 'PRODUCT_COSTING'
   | 'CUSTOMER'
   | 'CREDIT_LEDGER'
   | 'DAILY_SUMMARY';
@@ -51,6 +52,8 @@ export interface ProductCosting {
   supplierInfo?: string;
   /** Units on hand at last costing update — used for weighted-average costing. */
   currentQty?: number;
+  /** Owning shop — tenant key used for cloud mirror scoping (RLS/sync). */
+  shopId?: string;
   updatedAt: number;
 }
 

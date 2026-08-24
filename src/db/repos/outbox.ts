@@ -1,6 +1,6 @@
 import { db } from '../db';
 import { isCloudShopId, uid } from '../../lib/utils';
-import type { OutboxEntry, OutboxStatus } from '../../types';
+import type { OutboxEntry, OutboxStatus, DailySummary, StockLedgerEntry } from '../../types';
 
 const DEVICE_KEY = 'alorashop_device_id';
 
@@ -138,6 +138,53 @@ export async function markSaleSynced(saleId: string, outboxId: string): Promise<
 export async function markProductSynced(productId: string, outboxId: string): Promise<void> {
   await db.transaction('rw', db.products, db.outbox, async () => {
     await db.outbox.delete(outboxId);
+  });
+}
+
+/**
+ * Enqueue a daily-summary doc to the cloud mirror.
+ *
+ * Daily summaries are the ONLY thing a fresh device pulls to bootstrap
+ * dashboards/analytics without scanning raw sales — but no code path was
+ * enqueuing them, so `daily_summaries` never reached the cloud and every
+ * fresh-install dashboard came up empty. (Finding 2.) Call this after every
+ * local summary write (sale increment, void reversal, profit backfill).
+ *
+ * Demo shop (non-uuid) has no cloud account — skip like every other entity.
+ */
+export async function enqueueDailySummary(summary: DailySummary): Promise<void> {
+  if (!summary || !isCloudShopId(summary.shopId)) return;
+  await db.outbox.add({
+    id: uid(),
+    idempotencyKey: `daily_summary_${summary.id}`,
+    entityType: 'DAILY_SUMMARY',
+    payload: summary,
+    status: 'PENDING',
+    retryCount: 0,
+    createdAt: Date.now()
+  });
+}
+
+/**
+ * Enqueue a stock-ledger movement to the cloud mirror.
+ *
+ * Stock-ledger is append-only (the only source a fresh device can rebuild the
+ * audit trail from) — but only explicit restocks were being enqueued, so SALE
+ * and VOID movements (and a product's opening RESTOCK row) never reached the
+ * cloud. (Finding 3.) Call this after every local ledger write.
+ *
+ * Demo shop (non-uuid) has no cloud account — skip like every other entity.
+ */
+export async function enqueueStockLedger(entry: StockLedgerEntry): Promise<void> {
+  if (!entry || !isCloudShopId(entry.shopId)) return;
+  await db.outbox.add({
+    id: uid(),
+    idempotencyKey: `stock_ledger_${entry.id}`,
+    entityType: 'RESTOCK', // all stock_ledger rows sync through this entity
+    payload: entry,
+    status: 'PENDING',
+    retryCount: 0,
+    createdAt: Date.now()
   });
 }
 

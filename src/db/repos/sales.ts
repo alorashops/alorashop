@@ -2,6 +2,7 @@ import { db } from '../db';
 import { uid, todayKey, isCloudShopId } from '../../lib/utils';
 import { newIdempotencyKey } from '../../lib/idempotency';
 import { syncCreditBalanceCache } from './customers';
+import { enqueueDailySummary, enqueueStockLedger } from './outbox';
 import type { Sale, SaleItem, PaymentSplit, PaymentMethod, PaymentStatus, DailySummary } from '../../types';
 
 export interface CreateSaleInput {
@@ -74,16 +75,20 @@ export async function createSale(input: CreateSaleInput): Promise<Sale> {
       if (!product) continue;
       const nextQty = Math.max(0, product.stockQuantity + delta);
       await db.products.put({ ...product, stockQuantity: nextQty, updatedAt: now });
-      await db.stockLedger.add({
+      const ledgerEntry = {
         id: uid(),
         productId,
-        type: 'SALE',
+        type: 'SALE' as const,
         quantityDelta: delta,
         referenceId: saleId,
         actorId: input.cashierId,
         shopId: input.shopId,
         createdAt: now
-      });
+      };
+      await db.stockLedger.add(ledgerEntry);
+      // SALE movements are append-only and must reach the cloud — otherwise a
+      // fresh device rebuilds a stock ledger missing every sale (Finding 3).
+      await enqueueStockLedger(ledgerEntry);
     }
 
     // 3. Credit ledger entries for store-credit payments.
@@ -182,6 +187,9 @@ export async function incrementDailySummary(shopId: string, sale: Sale): Promise
     lastUpdatedAt: Date.now()
   };
   await db.dailySummaries.put(summary);
+  // Push the pre-aggregated summary to the cloud so other/fresh devices can
+  // rebuild dashboards without scanning raw sales (Finding 2).
+  await enqueueDailySummary(summary);
 }
 
 export async function getSaleById(id: string): Promise<Sale | undefined> {
@@ -251,16 +259,19 @@ export async function voidSale(saleId: string, actorId: string, reason?: string)
       const product = await db.products.get(productId);
       if (!product) continue;
       await db.products.put({ ...product, stockQuantity: Math.max(0, product.stockQuantity + delta), updatedAt: now });
-      await db.stockLedger.add({
+      const ledgerEntry = {
         id: uid(),
         productId,
-        type: 'VOID',
+        type: 'VOID' as const,
         quantityDelta: delta,
         referenceId: reversalId,
         actorId,
         shopId: sale.shopId,
         createdAt: now
-      });
+      };
+      await db.stockLedger.add(ledgerEntry);
+      // VOID movements are append-only and must reach the cloud too (Finding 3).
+      await enqueueStockLedger(ledgerEntry);
     }
 
     // 2b. Credit reversal — a voided credit sale must also undo the customer's
@@ -325,7 +336,7 @@ export async function voidSale(saleId: string, actorId: string, reason?: string)
         }
       }
 
-      await db.dailySummaries.put({
+      const nextSummary: DailySummary = {
         ...summary,
         salesCount: Math.max(0, summary.salesCount - 1),
         totalRevenue: Math.max(0, summary.totalRevenue - sale.totalAmount),
@@ -336,7 +347,10 @@ export async function voidSale(saleId: string, actorId: string, reason?: string)
         },
         topSelling: topList.sort((a, b) => b.qty - a.qty).slice(0, 10),
         lastUpdatedAt: now
-      });
+      };
+      await db.dailySummaries.put(nextSummary);
+      // Void also rewrites the summary — mirror it so other devices converge.
+      await enqueueDailySummary(nextSummary);
     }
 
     await db.outbox.add({

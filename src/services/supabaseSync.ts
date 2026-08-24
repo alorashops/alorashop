@@ -20,6 +20,7 @@ export type CloudEntity =
   | 'SALE'
   | 'VOID'
   | 'PRODUCT'
+  | 'PRODUCT_COSTING'
   | 'RESTOCK'
   | 'CUSTOMER'
   | 'CREDIT_LEDGER'
@@ -63,6 +64,11 @@ const ENTITY_MAP: Record<CloudEntity, { table: string; data: (p: any) => Record<
     ts: (p) => p.updatedAt,
     data: (p) => p
   },
+  PRODUCT_COSTING: {
+    table: 'product_costing',
+    ts: (p) => p.updatedAt,
+    data: (p) => p
+  },
   RESTOCK: {
     table: 'stock_ledger',
     ts: (p) => p.createdAt,
@@ -87,6 +93,7 @@ const ENTITY_MAP: Record<CloudEntity, { table: string; data: (p: any) => Record<
 
 const PULL_TABLES: Array<{ table: string; entity: CloudEntity }> = [
   { table: 'products', entity: 'PRODUCT' },
+  { table: 'product_costing', entity: 'PRODUCT_COSTING' },
   { table: 'sales', entity: 'SALE' },
   { table: 'stock_ledger', entity: 'RESTOCK' },
   { table: 'daily_summaries', entity: 'DAILY_SUMMARY' },
@@ -125,13 +132,16 @@ export function buildCloudRows(entries: OutboxEntry[]): CloudRow[] {
     if (!UUID_RE.test(shopId)) continue;
 
     const data = map.data(payload);
-    if (!data?.id) continue;
+    // Most entities key their mirror row on `id`; ProductCosting keys on
+    // `productId` (migration 0003: id = the local ProductCosting.productId).
+    const rowId = data?.id ?? data?.productId;
+    if (!rowId) continue;
 
     rows.push({
       entryId: entry.id,
       entityType: entry.entityType as CloudEntity,
       table: map.table,
-      id: String(data.id),
+      id: String(rowId),
       shopId,
       updatedAt:
         typeof map.ts(payload) === 'number' ? (map.ts(payload) as number) : Date.now(),
@@ -183,7 +193,11 @@ export async function pullCloudChanges(cursor: number): Promise<PulledChange[]> 
     if (error) throw error;
     for (const row of data ?? []) {
       const payload = row?.data;
-      if (payload && typeof payload === 'object' && (payload as { id?: unknown }).id) {
+      // Accept both `id`-keyed docs and productId-keyed costing docs.
+      const hasKey =
+        payload && typeof payload === 'object' &&
+        ((payload as { id?: unknown }).id ?? (payload as { productId?: unknown }).productId) != null;
+      if (hasKey) {
         changes.push({
           entityType: t.entity,
           payload: payload as Record<string, unknown>,

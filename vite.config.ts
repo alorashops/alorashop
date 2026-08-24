@@ -25,15 +25,15 @@ export default defineConfig({
         ]
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
-        maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
-        runtimeCaching: [
-          {
-            // Never cache network sync calls — offline-first means IndexedDB is the source of truth.
-            urlPattern: /^https:\/\/firestore\.googleapis\.com\/.*/i,
-            handler: 'NetworkOnly'
-          }
-        ]
+        // PGlite's embedded Postgres ships as .wasm (10 MB) + .data (6.3 MB)
+        // engine files side-loaded relative to import.meta.url. They MUST be
+        // precached or an offline launch cannot boot the local database —
+        // without them the shell mounts but hangs at "Loading local database…"
+        // forever. That's why .wasm/.data are in the globs AND the size cap is
+        // raised above the engine's biggest single file.
+        globPatterns: ['**/*.{js,css,html,svg,png,woff2,wasm,data}'],
+        maximumFileSizeToCacheInBytes: 20 * 1024 * 1024,
+        runtimeCaching: []
       }
     })
   ],

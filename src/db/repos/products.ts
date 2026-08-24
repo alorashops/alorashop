@@ -1,5 +1,6 @@
 import { db } from '../db';
 import { uid } from '../../lib/utils';
+import { enqueueStockLedger } from './outbox';
 import type { Product, ProductCosting } from '../../types';
 
 /**
@@ -68,25 +69,45 @@ export async function createProduct(shopId: string, actorId: string, input: NewP
   await db.transaction('rw', db.products, db.productCosting, db.stockLedger, db.outbox, async () => {
     await db.products.add(product);
     if (input.costPrice !== undefined) {
-      await db.productCosting.put({
+      const costing: ProductCosting = {
         productId: product.id,
         costPrice: input.costPrice,
         weightedAverageCost: input.costPrice,
         supplierInfo: input.supplierInfo,
+        shopId,
         updatedAt: now
+      };
+      await db.productCosting.put(costing);
+      // Costing must reach the cloud too — it lives in its OWN mirror table
+      // (product_costing, migration 0003) so cost/supplier never leak into the
+      // products doc that cashiers can read. Without this row, a fresh device
+      // pulls products with no costing and shows cost = 0 forever.
+      await db.outbox.add({
+        id: uid(),
+        idempotencyKey: `product_costing_${product.id}`,
+        entityType: 'PRODUCT_COSTING',
+        payload: costing,
+        status: 'PENDING',
+        retryCount: 0,
+        createdAt: now
       });
     }
     if (input.stockQuantity > 0) {
-      await db.stockLedger.add({
+      const ledgerEntry = {
         id: uid(),
         productId: product.id,
-        type: 'RESTOCK',
+        type: 'RESTOCK' as const,
         quantityDelta: input.stockQuantity,
         referenceId: product.id,
         actorId,
         shopId,
         createdAt: now
-      });
+      };
+      await db.stockLedger.add(ledgerEntry);
+      // Opening RESTOCK row must reach the cloud too — previously only the
+      // PRODUCT row synced, so this product's stock origin was missing from
+      // every other device's audit trail (Finding 3).
+      await enqueueStockLedger(ledgerEntry);
     }
     await db.outbox.add({
       id: uid(),
@@ -133,12 +154,26 @@ export async function updateProduct(productId: string, input: UpdateProductInput
         costPrice: input.costPrice,
         weightedAverageCost: input.costPrice,
         supplierInfo: input.supplierInfo,
+        shopId: existing.shopId,
         updatedAt: now
       };
       costing.costPrice = input.costPrice;
       costing.supplierInfo = input.supplierInfo ?? costing.supplierInfo;
+      // Tenant key: legacy local rows predate the shopId field — backfill it
+      // now from the product so the row can map onto the cloud mirror.
+      costing.shopId = costing.shopId ?? existing.shopId;
+      if (costing.weightedAverageCost == null) costing.weightedAverageCost = input.costPrice;
       costing.updatedAt = now;
       await db.productCosting.put(costing);
+      await db.outbox.add({
+        id: uid(),
+        idempotencyKey: `product_costing_${productId}`,
+        entityType: 'PRODUCT_COSTING',
+        payload: costing,
+        status: 'PENDING',
+        retryCount: 0,
+        createdAt: now
+      });
     }
     await db.outbox.add({
       id: uid(),

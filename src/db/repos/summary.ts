@@ -1,5 +1,6 @@
 import { db } from '../db';
 import { todayKey } from '../../lib/utils';
+import { enqueueDailySummary } from './outbox';
 import type { DailySummary, ProductCosting, Sale } from '../../types';
 
 /**
@@ -53,7 +54,10 @@ export async function backfillProfits(shopId: string, date?: string): Promise<nu
     const key = `${shopId}_${date ?? todayKey()}`;
     const summary = await db.dailySummaries.get(key);
     if (summary) {
-      await db.dailySummaries.put({ ...summary, totalProfit: profitSum, lastUpdatedAt: Date.now() });
+      const next = { ...summary, totalProfit: profitSum, lastUpdatedAt: Date.now() };
+      await db.dailySummaries.put(next);
+      // Backfill rewrites the summary (profit is restricted data) — mirror it.
+      await enqueueDailySummary(next);
     }
   });
   return profitSum;
