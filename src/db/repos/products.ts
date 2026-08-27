@@ -241,41 +241,39 @@ export async function restockProduct(
 }
 
 /**
- * Smart delete — always safe for the books:
- *  - No financial or stock history → hard delete (frees the row entirely).
- *  - Has history (was restocked, sold, etc.) → soft delete ("archived").
- *    The row is kept so past sales / stock-ledger / daily summaries still
- *    resolve by productId, but it's hidden from checkout and the inventory list.
+ * Delete = archive, always.
+ *
+ * The local device NEVER hard-deletes a product. Every delete becomes a soft
+ * archive (hidden from checkout + inventory, still resolves history) AND is
+ * always enqueued to the cloud mirror, so other/fresh devices converge on
+ * `archived: true` too.
+ *
+ * (Finding from production: products with no history were hard-deleted locally
+ * with NO outbox row — the append-only cloud mirror never learned about it,
+ * so "erase local data" + re-pull resurrected them as ACTIVE. Always-archive
+ * closes that hole for every delete, history or not. A future retention purge
+ * can prune old archives safely because archivedAt is now stamped.)
  */
 export async function deleteProduct(productId: string): Promise<{ archived: boolean }> {
-  const hasLedger = await db.stockLedger.where('productId').equals(productId).count();
   const product = await db.products.get(productId);
+  if (!product) return { archived: true }; // idempotent — nothing to delete
+  if (product.archived) return { archived: true }; // already archived
 
-  if (hasLedger > 0) {
-    // Has history — keep the row, just hide it. Preserve all references.
-    if (product && !product.archived) {
-      const now = Date.now();
-      const next: Product = { ...product, archived: true, updatedAt: now };
-      await db.transaction('rw', db.products, db.outbox, async () => {
-        await db.products.put(next);
-        await db.outbox.add({
-          id: uid(),
-          idempotencyKey: `product_${productId}_archive`,
-          entityType: 'PRODUCT',
-          payload: next,
-          status: 'PENDING',
-          retryCount: 0,
-          createdAt: now
-        });
-      });
-    }
-    return { archived: true };
-  }
-
-  // No history → it's a draft/typo; permanently remove it.
-  await db.transaction('rw', db.products, db.productCosting, async () => {
-    await db.products.delete(productId);
-    await db.productCosting.where('productId').equals(productId).delete();
+  const now = Date.now();
+  const next: Product = { ...product, archived: true, archivedAt: now, updatedAt: now };
+  await db.transaction('rw', db.products, db.outbox, async () => {
+    await db.products.put(next);
+    // Always enqueue (even for no-history drafts) — the cloud must know, or a
+    // fresh device (or erase + re-pull on this one) resurrects it as sellable.
+    await db.outbox.add({
+      id: uid(),
+      idempotencyKey: `product_${productId}_archive`,
+      entityType: 'PRODUCT',
+      payload: next,
+      status: 'PENDING',
+      retryCount: 0,
+      createdAt: now
+    });
   });
-  return { archived: false };
+  return { archived: true };
 }

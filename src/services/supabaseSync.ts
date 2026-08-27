@@ -175,36 +175,59 @@ export async function upsertCloudRows(rows: CloudRow[]): Promise<void> {
   }
 }
 
+/** Pull page size — well under Supabase's 1,000-row cap so each response stays
+    small (sales rows carry heavyweight JSONB) while keeping round-trips few. */
+const PULL_PAGE_SIZE = 500;
+
 /**
  * Delta pull — every row in every sync table newer than the cursor.
  *
  * Cursor 0 is a fresh device: there is no watermark yet, so we pull the whole
  * shop (gt 0 = every row) once and let the caller stamp the max applied value.
+ *
+ * Pagination: Supabase caps any single query at 1,000 rows, so a shop with
+ * more than that on a fresh device used to load in slow 15s-tick chunks (the
+ * oldest 1,000, then 1,001–2,000 next tick, …). Each table is now drained
+ * fully in one call via `.range()` pages (sequential, newest cursor fixed for
+ * the whole drain), so `pullDelta` exhausts every table before the cursor is
+ * advanced — no more 15s-gated partial loads. (Fix #3.)
+ *
+ * Termination is guaranteed: a page shorter than PAGE_SIZE (or empty) ends the
+ * loop; an empty table costs exactly one request.
  */
 export async function pullCloudChanges(cursor: number): Promise<PulledChange[]> {
   const sb = getClient();
   const changes: PulledChange[] = [];
   for (const t of PULL_TABLES) {
-    const { data, error } = await sb
-      .from(t.table)
-      .select('data, updated_at')
-      .gt('updated_at', cursor)
-      .order('updated_at', { ascending: true });
-    if (error) throw error;
-    for (const row of data ?? []) {
-      const payload = row?.data;
-      // Accept both `id`-keyed docs and productId-keyed costing docs.
-      const hasKey =
-        payload && typeof payload === 'object' &&
-        ((payload as { id?: unknown }).id ?? (payload as { productId?: unknown }).productId) != null;
-      if (hasKey) {
-        changes.push({
-          entityType: t.entity,
-          payload: payload as Record<string, unknown>,
-          // Supabase may hand back bigint as number or string — coerce to number.
-          updatedAt: Number(row?.updated_at ?? 0)
-        });
+    let from = 0;
+    // Draining until a short page is an explicit while(true) — a long-running
+    // fresh-install sync is exactly the case where off-by-one loop bugs hide.
+    while (true) {
+      const { data, error } = await sb
+        .from(t.table)
+        .select('data, updated_at')
+        .gt('updated_at', cursor)
+        .order('updated_at', { ascending: true })
+        .range(from, from + PULL_PAGE_SIZE - 1);
+      if (error) throw error;
+      const page = data ?? [];
+      for (const row of page) {
+        const payload = row?.data;
+        // Accept both `id`-keyed docs and productId-keyed costing docs.
+        const hasKey =
+          payload && typeof payload === 'object' &&
+          ((payload as { id?: unknown }).id ?? (payload as { productId?: unknown }).productId) != null;
+        if (hasKey) {
+          changes.push({
+            entityType: t.entity,
+            payload: payload as Record<string, unknown>,
+            // Supabase may hand back bigint as number or string — coerce to number.
+            updatedAt: Number(row?.updated_at ?? 0)
+          });
+        }
       }
+      if (page.length < PULL_PAGE_SIZE) break; // short/empty page = drained
+      from += PULL_PAGE_SIZE;
     }
   }
   return changes;

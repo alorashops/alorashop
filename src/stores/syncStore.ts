@@ -23,6 +23,8 @@ interface SyncState {
   setSyncing: (v: boolean) => void;
   markSynced: () => void;
   markSyncError: (msg: string) => void;
+  /** Clear a previously surfaced sync error (e.g. after a successful retry). */
+  clearError: () => void;
 }
 
 export const useSyncStore = create<SyncState>((set) => ({
@@ -59,7 +61,8 @@ export const useSyncStore = create<SyncState>((set) => ({
   setOnline: (v) => set({ online: v }),
   setSyncing: (v) => set({ syncing: v }),
   markSynced: () => set((s) => ({ lastSyncAt: Date.now(), syncing: false, lastError: undefined, pending: 0 })),
-  markSyncError: (msg) => set({ syncing: false, lastError: msg })
+  markSyncError: (msg) => set({ syncing: false, lastError: msg }),
+  clearError: () => set({ lastError: undefined })
 }));
 
 export function quotaLevel(pct: number): 'ok' | 'warn' | 'critical' {

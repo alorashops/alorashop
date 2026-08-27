@@ -66,4 +66,7 @@ function makeIcon(size) {
 
 writeFileSync(join(publicDir, 'alora-icon-192.png'), makeIcon(192));
 writeFileSync(join(publicDir, 'alora-icon-512.png'), makeIcon(512));
-console.log('Icons generated: alora-icon-192.png, alora-icon-512.png');
+// iOS home-screen icon: Apple wants a dedicated 180x180 PNG (no alpha, uniform
+// corners). Without it iOS crops a screenshot of the page instead.
+writeFileSync(join(publicDir, 'alora-icon-180.png'), makeIcon(180));
+console.log('Icons generated: alora-icon-192.png, alora-icon-512.png, alora-icon-180.png');

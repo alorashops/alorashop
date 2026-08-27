@@ -11,6 +11,7 @@ import {
   type User
 } from '@supabase/supabase-js';
 import { supabaseUrl, supabaseAnonKey, isSupabaseConfigured } from '../config/env';
+import type { Role } from '../types';
 
 let clientPromise: Promise<SupabaseClient> | undefined;
 
@@ -140,6 +141,55 @@ export async function createShop(shopName: string, phone?: string): Promise<stri
   const { data, error } = await sb.rpc('create_shop', { shop_name: shopName, phone: phone ?? null });
   if (error) throw error;
   return data as string; // the new shop_id
+}
+
+/**
+ * Adds a staff member via the SECURITY DEFINER RPC. Role guardrails run
+ * server-side: admin may add manager/cashier, manager may add cashier only.
+ * Returns the new user's id.
+ *
+ * IMPORTANT: this only CREATES the account (email-unconfirmed, unusable
+ * password). The caller must then call `sendStaffInvite()` so the new hire
+ * receives an email with a recovery link to set their own password.
+ */
+export async function addStaff(email: string, displayName: string, role: Role): Promise<string> {
+  const sb = await getSupabase();
+  const { data, error } = await sb.rpc('add_staff', {
+    staff_email: email.trim(),
+    staff_name: displayName.trim(),
+    staff_role: role
+  });
+  if (error) throw error;
+  return data as string;
+}
+
+/**
+ * Emails the staff member a password-recovery link (GoTrue's default recovery
+ * template) — the invite mechanism. Clicking it purports to set a password; we
+ * guide them to it, which both verifies their email and completes the signup.
+ * Uses the public anon-key endpoint, so no service-role secret is required.
+ * `#/reset` matches the HashRouter route for the invite landing screen.
+ */
+export async function sendStaffInvite(email: string): Promise<void> {
+  const sb = await getSupabase();
+  const { error } = await sb.auth.resetPasswordForEmail(email.trim(), {
+    redirectTo: `${window.location.origin}${window.location.pathname}#/reset`
+  });
+  if (error) throw error;
+}
+
+/** Sets a new password for the currently-authenticated (recovery) session. */
+export async function updatePassword(newPassword: string): Promise<void> {
+  const sb = await getSupabase();
+  const { error } = await sb.auth.updateUser({ password: newPassword });
+  if (error) throw error;
+}
+
+/** True when an active session exists (a recovery link / invite has been opened). */
+export async function hasActiveSession(): Promise<boolean> {
+  const sb = await getSupabase();
+  const { data } = await sb.auth.getSession();
+  return Boolean(data.session);
 }
 
 /**

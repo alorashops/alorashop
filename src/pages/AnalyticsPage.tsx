@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useAuthStore, shopIdOf, canSeeCosting } from '../stores/authStore';
 import { useUiStore } from '../stores/uiStore';
-import { getSummariesRange, getTopSellingRange, backfillProfits, getStockValue } from '../db/repos/summary';
+import { getSummariesRange, getTopSellingRange, backfillProfits, getStockValue, type TopSellingItem } from '../db/repos/summary';
 import { fmtMoneyCompact, todayKey, pct } from '../lib/utils';
 import { EmptyState } from '../components/ui';
 import type { DailySummary } from '../types';
@@ -20,7 +20,7 @@ export default function AnalyticsPage() {
   const [fromDate, setFromDate] = useState(() => offsetDate(-6));
   const [toDate, setToDate] = useState(() => todayKey());
   const [summaries, setSummaries] = useState<DailySummary[]>([]);
-  const [topSelling, setTopSelling] = useState<DailySummary['topSelling']>([]);
+  const [topSelling, setTopSelling] = useState<TopSellingItem[]>([]);
   const [stockValue, setStockValue] = useState<{ count: number; value: number }>({ count: 0, value: 0 });
   const [backfilling, setBackfilling] = useState(false);
 
@@ -44,7 +44,17 @@ export default function AnalyticsPage() {
   const doBackfill = async () => {
     setBackfilling(true);
     try {
-      const profit = await backfillProfits(shopIdOf());
+      // Backfill EVERY day in the selected range so range-level and per-product
+      // profit are real — backfilling only today leaves the rest of the range
+      // showing GH₵0.
+      let profit = 0;
+      const start = new Date(`${fromDate}T00:00:00`);
+      const end = new Date(`${toDate}T23:59:59.999`);
+      const d = new Date(start);
+      while (d.getTime() <= end.getTime()) {
+        profit += await backfillProfits(shopIdOf(), todayKey(d));
+        d.setDate(d.getDate() + 1);
+      }
       toast.push('success', `Profit backfill complete — ${fmtMoneyCompact(profit)}`);
       void load();
     } catch (err) {
@@ -169,7 +179,24 @@ export default function AnalyticsPage() {
                     <span style={{ fontWeight: 700 }}>
                       {i + 1}. {t.productName}
                     </span>
-                    <span style={{ color: 'var(--text-muted)' }}>{t.qty} units</span>
+                    <span style={{ display: 'flex', gap: 12, alignItems: 'baseline' }}>
+                      <span style={{ color: 'var(--text-muted)' }}>{t.qty} units</span>
+                      {seeProfit && (
+                        <span
+                          style={{
+                            fontWeight: 800,
+                            color: t.profit === undefined ? 'var(--text-muted)' : t.profit < 0 ? 'var(--danger)' : 'var(--success)'
+                          }}
+                          title={t.profit !== undefined ? 'Gross profit after backfill' : 'Backfill to see per-product profit'}
+                        >
+                          {t.profit === undefined ? '—' : `+${fmtMoneyCompact(t.profit)}`}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-muted)', marginBottom: 3 }}>
+                    <span>Revenue {fmtMoneyCompact(t.revenue)}</span>
+                    {seeProfit && t.profit !== undefined && <span>Profit {fmtMoneyCompact(t.profit)}</span>}
                   </div>
                   <div style={{ background: 'var(--surface-2)', borderRadius: 6, height: 8 }}>
                     <div

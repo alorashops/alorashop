@@ -239,7 +239,13 @@ export function canManageInventory(role: Role | undefined): boolean {
   return role === 'manager' || role === 'admin';
 }
 
+/** May VIEW the staff list and add staff (the staff card on Settings). */
 export function canManageStaff(role: Role | undefined): boolean {
+  return role === 'admin' || role === 'manager';
+}
+
+/** May add MANAGER accounts - admins only (managers add cashiers only). */
+export function canAddManager(role: Role | undefined): boolean {
   return role === 'admin';
 }
 

@@ -40,6 +40,9 @@ export interface Product {
   /** Soft-delete: archived products are hidden from checkout + inventory list
       but kept so historical sales/ledgers/summaries still resolve. */
   archived?: boolean;
+  /** When the product was archived (epoch ms) — the seed for a future
+      retention purge. Undefined on live products. */
+  archivedAt?: number;
   shopId: string;
   updatedAt: number;
 }

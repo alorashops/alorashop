@@ -47,7 +47,7 @@ export function subscribeLowStock(cb: (count: number) => void): () => void {
     const low = await db.products
       .where('shopId')
       .equals(shopId)
-      .filter((p) => p.stockQuantity <= p.minStockLevel)
+      .filter((p) => !p.archived && p.stockQuantity <= p.minStockLevel)
       .count();
     cb(low);
   };

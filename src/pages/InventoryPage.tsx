@@ -19,6 +19,15 @@ export default function InventoryPage() {
       jumps while typing (the old toFixed(2) reformat on every keystroke made
       editing a fight with the decimal point). Converted to minor units live. */
   const [priceText, setPriceText] = useState('');
+  /** Raw text for the cost-price field — same caret-friendly treatment as
+      priceText. Cost edits only go through when the field is actually touched. */
+  const [costText, setCostText] = useState('');
+  const [supplierText, setSupplierText] = useState('');
+  /** True after the manager touches Cost price or Supplier — prevents the save
+      from silently rewriting an untouched costing row to 0 when the edit modal
+      opens (finding doc noted cost/supplier were never editable; this keeps
+      them opt-in rather than "open + save wipes cost"). */
+  const [costDirty, setCostDirty] = useState(false);
   const [restockId, setRestockId] = useState<string | null>(null);
   const [restockQty, setRestockQty] = useState('10');
 
@@ -75,10 +84,15 @@ export default function InventoryPage() {
         category: editing.category,
         // editing.sellingPrice is already minor units (converted on input change)
         sellingPrice: editing.sellingPrice,
-        minStockLevel: Number(editing.minStockLevel)
+        minStockLevel: Number(editing.minStockLevel),
+        // Cost/supplier only submit when the manager actually changed them —
+        // opening the modal and saving must never wipe an existing costing row.
+        costPrice: seeCost && costDirty ? parseMoneyInput(costText) : undefined,
+        supplierInfo: seeCost && costDirty ? supplierText : undefined
       });
       toast.push('success', 'Product updated');
       setModal(null);
+      setCostDirty(false);
       void reload();
     } catch (err) {
       toast.push('error', err instanceof Error ? err.message : String(err));
@@ -103,10 +117,14 @@ export default function InventoryPage() {
     fields[next]?.scrollIntoView({ block: 'nearest' });
   };
 
-  /** Opens the edit modal, seeding the price field with the current amount. */
+  /** Opens the edit modal, seeding the price/cost/supplier fields. */
   const openEdit = (p: Product) => {
     setEditing(p);
     setPriceText((p.sellingPrice / 100).toFixed(2));
+    const c = costing.get(p.id);
+    setCostText(c && c.costPrice > 0 ? (c.costPrice / 100).toFixed(2) : '');
+    setSupplierText(c?.supplierInfo ?? '');
+    setCostDirty(false); // not touched yet — save leaves costing alone
     setModal('edit');
   };
 
@@ -197,7 +215,7 @@ export default function InventoryPage() {
                             onClick={() =>
                               toast.ask(
                                 'Delete product?',
-                                `"${p.name}" — deleted forever if it has no sales. If it has history, it's archived (hidden but kept for records).`,
+                                `"${p.name}" will be hidden from checkout and inventory (kept in records for history/analytics). This syncs to all devices.`,
                                 async () => {
                                   try {
                                     const res = await deleteProduct(p.id);
@@ -319,6 +337,29 @@ export default function InventoryPage() {
               <label>Lowest level (low-stock alert)</label>
               <input className="input" type="number" value={editing.minStockLevel} onChange={(e) => setEditing({ ...editing, minStockLevel: Number(e.target.value) })} />
             </div>
+            {seeCost && (
+              <div className="field">
+                <label>Cost price (GH₵) — manager only</label>
+                <input
+                  className="input"
+                  inputMode="decimal"
+                  value={costText}
+                  placeholder={costText === '' ? 'Not set' : undefined}
+                  onChange={(e) => { setCostText(e.target.value); setCostDirty(true); }}
+                />
+              </div>
+            )}
+            {seeCost && (
+              <div className="field">
+                <label>Supplier (optional)</label>
+                <input
+                  className="input"
+                  value={supplierText}
+                  placeholder="e.g. Distribution house / importer"
+                  onChange={(e) => { setSupplierText(e.target.value); setCostDirty(true); }}
+                />
+              </div>
+            )}
             <p style={{ fontSize: 11, color: 'var(--text-muted)' }}>
               Stock quantity changes go through the Restock flow — never edit quantity here (audit trail).
             </p>

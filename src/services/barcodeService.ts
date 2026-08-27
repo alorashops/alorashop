@@ -18,6 +18,20 @@ interface BarcodeService {
 const WINDOW_MS = 80; // typical wedge inter-key gap
 const TERMINATORS = ['Enter', 'Tab'];
 
+/**
+ * Is the event target an editable element (input / textarea / select /
+ * contenteditable)? The global wedge must ignore typos in any field — a human
+ * typing in search, cash or credit-search must never be misinterpreted as a
+ * scanner burst (which produced phantom "No product for code …" toasts).
+ */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+    return true;
+  }
+  return target.isContentEditable === true;
+}
+
 function createBarcodeService(): BarcodeService {
   let buffer = '';
   let lastKeyTime = 0;
@@ -33,6 +47,10 @@ function createBarcodeService(): BarcodeService {
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
+    // A real USB/Bluetooth scanner fires as a wedge on `window`/`document` with
+    // NO focused text field — it never targets an editable node. When one of our
+    // form fields is focused, this is user typing: back off entirely.
+    if (isEditableTarget(e.target)) return;
     const now = Date.now();
     if (now - lastKeyTime > 200 && buffer.length > 0) {
       // New burst — discard stale partial buffer (a human typing).

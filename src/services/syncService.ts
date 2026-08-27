@@ -1,8 +1,18 @@
 import { db, isOnline } from '../db';
-import { getQueuedOutbox, getPendingOutbox, markOutboxStatus, removeOutboxEntry, setSyncCursor, getSyncCursor, bumpQuota, markSaleSynced} from '../db/repos/outbox';
+import {
+  getQueuedOutbox,
+  getPendingOutbox,
+  markOutboxStatus,
+  removeOutboxEntry,
+  setSyncCursor,
+  getSyncCursor,
+  bumpQuota,
+  markSaleSynced
+} from '../db/repos/outbox';
 import { isRetryableError } from '../lib/idempotency';
 import { isSupabaseConfigured } from '../config/env';
 import { useSyncStore } from '../stores/syncStore';
+import { useInventoryStore } from '../stores/inventoryStore';
 import { buildCloudRows, upsertCloudRows, pullCloudChanges, type PulledChange } from './supabaseSync';
 
 /**
@@ -99,17 +109,48 @@ export async function flushOutbox(force = false): Promise<number> {
 /** Delta sync: pull only rows changed since the device cursor. */
 export async function pullDelta(): Promise<void> {
   if (!isSupabaseConfigured || !(await isOnline())) return;
-  const cursor = await getSyncCursor();
-  const changes = await pullCloudChanges(cursor);
-  const applied = await applyCloudChanges(changes);
-  // Cursor = the newest cloud updated_at we ACTUALLY applied in this pull,
-  // never the local wall clock. Rows we could not apply (missing id / unknown
-  // type) stay above the cursor so the next pull retries them instead of
-  // silently skipping them. Monotonic: never moves backwards.
-  const newest = applied.reduce((m, c) => Math.max(m, c.updatedAt), cursor);
-  await setSyncCursor(newest);
-  await bumpQuota('reads', Math.max(1, changes.length));
-  await useSyncStore.getState().refresh();
+  try {
+    const cursor = await getSyncCursor();
+    const changes = await pullCloudChanges(cursor);
+    const applied = await applyCloudChanges(changes);
+    // Cursor = the newest cloud updated_at we ACTUALLY applied in this pull,
+    // never the local wall clock. Rows we could not apply (missing id / unknown
+    // type) stay above the cursor so the next pull retries them instead of
+    // silently skipping them. Monotonic: never moves backwards.
+    const newest = applied.reduce((m, c) => Math.max(m, c.updatedAt), cursor);
+    await setSyncCursor(newest);
+    await bumpQuota('reads', Math.max(1, changes.length));
+    // Pull applied real rows -> refresh the UI-facing stores so newly synced
+    // products appear IMMEDIATELY (POS grid + inventory list) instead of only
+    // after the 30s low-stock tick. Placement is deliberate:
+    //  - AFTER cursor stamping, so a UI refresh hiccup can never lose the
+    //    watermark (monotonic progress is preserved).
+    //  - Gated on applied.length > 0, so a quiet 15s tick with nothing new
+    //    doesn't restart the products read every time.
+    //  - Wrapped in try/catch, so a transient UI refresh failure cannot abort
+    //    the pull (it retries store-side on the next tick or page mount).
+    if (applied.length > 0) {
+      try {
+        await useInventoryStore.getState().refresh();
+      } catch {
+        // Cursor already advanced — non-fatal for the pull itself.
+      }
+    }
+    // A successful pull proves the cloud is reachable — clear any previously
+    // surfaced pull error so a transient failure doesn't stick forever.
+    useSyncStore.getState().clearError();
+    await useSyncStore.getState().refresh();
+  } catch (err) {
+    // The pull FAILED (network / auth / RLS / quota) — surface it via the same
+    // error slot push errors use (shown in Settings). Previously these were
+    // swallowed by the caller's `.catch(() => undefined)`, so a failed pull
+    // looked identical to a shop with no data. Recovery stays automatic:
+    // we only record the message; the next 15s tick retries the pull and a
+    // successful pull clears the error. (Fix #2.)
+    const msg = err instanceof Error ? err.message : String(err);
+    useSyncStore.getState().markSyncError(msg);
+    await useSyncStore.getState().refresh();
+  }
 }
 
 /** Apply cloud rows locally; returns only the changes that were actually written. */

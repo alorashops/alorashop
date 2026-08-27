@@ -7,6 +7,14 @@
     <meta name="theme-color" content="#0f172a" />
     <meta name="description" content="AloraShop — offline-first POS & shop management for small retail shops" />
     <title>AloraShop POS</title>
+    <!-- iOS PWA: no install button exists on iOS — users must "Add to Home
+         Screen". These make the home-screen app open standalone with the real
+         icon (a 180x180 PNG) instead of a screenshot of the page. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="AloraShop" />
+    <link rel="apple-touch-icon" href="/alora-icon-180.png" />
   </head>
   <body>
     <div id="root"></div>

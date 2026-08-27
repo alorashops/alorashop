@@ -1,13 +1,16 @@
 import { useEffect, useState } from 'react';
-import { useAuthStore, canManageStaff } from '../stores/authStore';
+import { useAuthStore, canManageStaff, canAddManager } from '../stores/authStore';
 import { useSyncStore } from '../stores/syncStore';
 import { useUiStore } from '../stores/uiStore';
 import { db } from '../db';
 import { clearLocalData } from '../services/seedService';
 import { flushOutbox } from '../services/syncService';
 import { purgeLocalOnlyOutbox } from '../db/repos/outbox';
-import { DEFAULT_SHOP_NAME } from '../config/env';
-import type { UserProfile } from '../types';
+import { addStaff, sendStaffInvite } from '../services/supabase';
+import { Modal } from '../components/ui';
+import { DEFAULT_SHOP_NAME, isSupabaseConfigured } from '../config/env';
+import { useInstallPrompt } from '../hooks/useInstallPrompt';
+import type { UserProfile, Role } from '../types';
 
 const ROLE_MATRIX: Array<[string, string, boolean, boolean, boolean]> = [
   ['Scan items, sell, split payment', 'Checkout', true, true, true],
@@ -17,7 +20,7 @@ const ROLE_MATRIX: Array<[string, string, boolean, boolean, boolean]> = [
   ['Manage inventory, restock, damage logs', 'Inventory', false, true, true],
   ['Approve voids & returns', 'Voids', false, true, true],
   ['Shop-wide analytics & reports', 'Analytics', false, true, true],
-  ['Manage staff accounts & roles', 'Staff', false, false, true],
+  ['Add staff accounts (cashiers; admins add managers too)', 'Staff', false, true, true],
   ['Shop settings, pricing, data export', 'Settings', false, false, true]
 ];
 
@@ -29,12 +32,25 @@ export default function SettingsPage() {
   const localOnly = useSyncStore((s) => s.localOnly);
   const lastError = useSyncStore((s) => s.lastError);
   const refreshSync = useSyncStore((s) => s.refresh);
-  const isAdmin = canManageStaff(user?.role);
+  // Staff card shows for both admin & manager (manager adds cashiers only).
+  const canManage = canManageStaff(user?.role);
+  const isAdmin = canAddManager(user?.role);
   const [staff, setStaff] = useState<UserProfile[]>([]);
   const [exporting, setExporting] = useState(false);
+  // Add-staff modal
+  const [staffModalOpen, setStaffModalOpen] = useState(false);
+  const [staffEmail, setStaffEmail] = useState('');
+  const [staffName, setStaffName] = useState('');
+  const [staffRole, setStaffRole] = useState<Role>('cashier');
+  const [addingStaff, setAddingStaff] = useState(false);
+  const { state: installState, promptInstall } = useInstallPrompt();
+
+  const loadStaff = () => {
+    void db.users.toArray().then(setStaff);
+  };
 
   useEffect(() => {
-    void db.users.toArray().then(setStaff);
+    loadStaff();
   }, []);
 
   const exportData = async () => {
@@ -113,6 +129,41 @@ export default function SettingsPage() {
     );
   };
 
+  /**
+   * Creates the staff account on the cloud (SECURITY DEFINER add_staff RPC),
+   * sends them an invite email to set their OWN password, then mirrors the new
+   * profile row locally so the list updates immediately. Role guardrails run
+   * on the server — this UI only offers valid options.
+   */
+  const handleAddStaff = async () => {
+    if (!isSupabaseConfigured) {
+      toast.push('error', 'Cloud not configured — staff invites need a connected Supabase project (.env).');
+      return;
+    }
+    if (!staffEmail.trim() || !staffName.trim()) {
+      toast.push('warn', 'Please fill in the name and email.');
+      return;
+    }
+    setAddingStaff(true);
+    try {
+      // Creates the account (unconfirmed, no usable password).
+      const uid = await addStaff(staffEmail, staffName, staffRole);
+      // Sends the invite email with a recovery link → staff set their own password.
+      await sendStaffInvite(staffEmail);
+      await db.users.put({ uid, shopId: user?.shopId ?? '', displayName: staffName.trim(), role: staffRole });
+      toast.push('success', `Invite sent — ${staffName.trim()} will set their own password.`);
+      setStaffModalOpen(false);
+      setStaffEmail('');
+      setStaffName('');
+      setStaffRole('cashier');
+      loadStaff();
+    } catch (err) {
+      toast.push('error', err instanceof Error ? err.message : String(err));
+    } finally {
+      setAddingStaff(false);
+    }
+  };
+
   return (
     <div className="page">
       <h1 className="page-title">Settings</h1>
@@ -178,9 +229,50 @@ export default function SettingsPage() {
         </div>
       </div>
 
-      {isAdmin && (
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 800, marginBottom: 10 }}>Install app</div>
+        {installState.isStandalone ? (
+          <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+            ✅ AloraShop is installed on this device — no action needed.
+          </p>
+        ) : installState.isIos ? (
+          <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+            <p style={{ marginTop: 0 }}>
+              iOS doesn't offer an install button in the browser. To add AloraShop to your home screen:
+            </p>
+            <ol style={{ margin: '6px 0 0 18px', paddingLeft: 4 }}>
+              <li>Tap the <strong>Share</strong> button in the browser.</li>
+              <li>Choose <strong>Add to Home Screen</strong>.</li>
+              <li>Tap <strong>Add</strong> in the top-right.</li>
+            </ol>
+            <p style={{ marginBottom: 0, color: 'var(--text-muted)' }}>
+              It will then open full-screen like a native app, with the AloraShop icon.
+            </p>
+          </div>
+        ) : installState.canInstall ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-start' }}>
+            <p style={{ margin: 0, fontSize: 13 }}>Install AloraShop to open it full-screen like a native app.</p>
+            <button className="btn btn-primary" onClick={() => void promptInstall()}>
+              📲 Install AloraShop
+            </button>
+          </div>
+        ) : (
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
+            Open this app in <strong>Chrome</strong> (Android) or <strong>Safari</strong> (iPhone) for install options.
+          </p>
+        )}
+      </div>
+
+      {canManage && (
         <div className="card">
-          <div style={{ fontWeight: 800, marginBottom: 10 }}>Staff accounts (admin only)</div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <span style={{ fontWeight: 800 }}>
+              Staff accounts {isAdmin ? '(admin)' : '(manager)'}
+            </span>
+            <button className="btn btn-sm btn-primary" onClick={() => setStaffModalOpen(true)}>
+              + Add staff
+            </button>
+          </div>
           <table className="table">
             <thead><tr><th>Name</th><th>Role</th><th>Shop</th></tr></thead>
             <tbody>
@@ -194,10 +286,49 @@ export default function SettingsPage() {
             </tbody>
           </table>
           <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
-            Production: roles live in auth custom claims (privileged admin path only) — never client-writable.
+            {isAdmin
+              ? 'Admins can add managers and cashiers. Roles enforce via Supabase RLS + auth claims, never the client.'
+              : 'Managers can add cashiers. Adding another manager requires an admin.'}
           </p>
         </div>
       )}
+
+      {/* Add staff modal */}
+      <Modal open={staffModalOpen} title="Add staff member" onClose={() => setStaffModalOpen(false)}>
+        <div style={{ display: 'grid', gap: 12 }}>
+          <div className="field">
+            <label>Full name</label>
+            <input className="input" value={staffName} onChange={(e) => setStaffName(e.target.value)} placeholder="e.g. Kofi Mensah" autoFocus />
+          </div>
+          <div className="field">
+            <label>Email (must be unique — they'll log in with this)</label>
+            <input className="input" type="email" value={staffEmail} onChange={(e) => setStaffEmail(e.target.value)} placeholder="you@example.com" />
+          </div>
+          <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            An invite email will be sent to this address with a secure link to set their own password. No password is shared through this device.
+          </p>
+          {isAdmin && (
+            <div className="field">
+              <label>Role</label>
+              <select className="select" value={staffRole} onChange={(e) => setStaffRole(e.target.value as Role)}>
+                <option value="cashier">Cashier</option>
+                <option value="manager">Manager</option>
+              </select>
+            </div>
+          )}
+          {!isAdmin && (
+            <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              As a manager you can add cashiers only. {user?.displayName} is the manager; the owner (admin) can add managers.
+            </p>
+          )}
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+            <button className="btn btn-secondary" onClick={() => setStaffModalOpen(false)}>Cancel</button>
+            <button className="btn btn-primary" onClick={() => void handleAddStaff()} disabled={addingStaff}>
+              {addingStaff ? 'Adding…' : 'Add staff'}
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

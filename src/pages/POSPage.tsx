@@ -20,6 +20,12 @@ export default function POSPage() {
   const [category, setCategory] = useState('All');
   const [discountStr, setDiscountStr] = useState('');
   const [cashStr, setCashStr] = useState('');
+  /** False while the cash field is showing the empty/full-total default — set
+      true the moment the cashier types, so the auto-fill stops overriding. */
+  const [cashDirty, setCashDirty] = useState(false);
+  /** Raw quantity text per cart line — kept separate so the caret never jumps
+      while typing a number (mirrors the price-field pattern on Inventory). */
+  const [qtyTexts, setQtyTexts] = useState<Record<string, string>>({});
   const [creditQuery, setCreditQuery] = useState('');
   const [creditResults, setCreditResults] = useState<Customer[]>([]);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | undefined>();
@@ -112,7 +118,9 @@ export default function POSPage() {
       cart.clear();
       setStage('items');
       setCashStr('');
+      setCashDirty(false);
       setDiscountStr('');
+      setQtyTexts({});
       toast.push('success', `Sale complete — ${sale.receiptNumber}`);
       toast.openReceipt(sale.id);
       void refresh();
@@ -132,6 +140,7 @@ export default function POSPage() {
    * so a stale tender never lingers.
    */
   const applyCash = (v: string) => {
+    setCashDirty(true);
     setCashStr(v);
     const amt = parseMoneyInput(v);
     if (amt > 0) {
@@ -143,10 +152,66 @@ export default function POSPage() {
     }
   };
 
+  /**
+   * Payment-tab switching. The one subtlety: cash auto-fills with the full
+   * total (just like CARD/PAYSTACK), so if the cashier switches to another
+   * method WITHOUT typing a custom tender (`!cashDirty`), that default CASH
+   * payment must be dropped — otherwise the other method sees `amountLeft: 0`
+   * and is disabled. A hand-typed partial tender is kept as a genuine split.
+   */
+  const switchPayment = (m: PaymentMethod) => {
+    const leavingCash = cart.activePayment === 'CASH' && m !== 'CASH';
+    if (leavingCash && !cashDirty) {
+      cart.setCashTendered(0);
+      cart.removePayment('CASH');
+      setCashStr('');
+    }
+    if (m === 'CASH') {
+      // Returning to cash begins from a fresh full-total default.
+      setCashDirty(false);
+      setCashStr('');
+      cart.setCashTendered(0);
+      cart.removePayment('CASH');
+    }
+    cart.setActivePayment(m);
+  };
+
+  /**
+   * Cash auto-default: while the CASH tab is active and the cashier hasn't
+   * typed a custom tender, mirror the total into the field + tender (the same
+   * behaviour CARD/PAYSTACK already have). Deliberately keyed on `total` — not
+   * `amountLeft` — so the payment it writes can never retrigger the effect.
+   */
+  useEffect(() => {
+    if (cart.activePayment !== 'CASH' || cashDirty) return;
+    const amt = total;
+    setCashStr(amt > 0 ? (amt / 100).toFixed(2) : '');
+    cart.setCashTendered(amt);
+    if (amt > 0) cart.addPayment({ method: 'CASH', amount: amt });
+    else cart.removePayment('CASH');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cart.activePayment, cashDirty, total]);
+
   /** Removes the most recently added cart line (mistake recovery). */
   const undoLast = () => {
     const last = cart.lines[cart.lines.length - 1];
-    if (last) cart.remove(last.productId);
+    if (last) {
+      cart.remove(last.productId);
+      setQtyTexts((t) => {
+        const { [last.productId]: _, ...rest } = t;
+        return rest;
+      });
+    }
+  };
+
+  /** Stepped quantity change from the − / + buttons. Mirrors `setQty`'s clamp
+      to [0, stockAvailable] and keeps the editable text in sync. */
+  const bumpQty = (productId: string, delta: number) => {
+    const line = cart.lines.find((l) => l.productId === productId);
+    if (!line) return;
+    const next = Math.max(0, Math.min(line.stockAvailable, line.quantity + delta));
+    cart.setQty(productId, next);
+    setQtyTexts((t) => ({ ...t, [productId]: String(next) }));
   };
 
   /** Loads the credit-picker list (top 8 matches by name/phone). */
@@ -161,6 +226,13 @@ export default function POSPage() {
     if (!isCreditAllowed(c)) {
       toast.push('warn', `${c.name} is not allowed credit — enable "Allow credit" in Customers.`);
       return;
+    }
+    // Drop any auto-filled default cash before a credit sale — the tab should
+    // cover what the cashier actually tendered, not a pre-filled full total.
+    if (cart.activePayment === 'CASH' && !cashDirty) {
+      cart.setCashTendered(0);
+      cart.removePayment('CASH');
+      setCashStr('');
     }
     cart.setCustomerId(c.id);
     cart.setActivePayment('CREDIT');
@@ -212,7 +284,6 @@ export default function POSPage() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               style={{ flex: 1, minWidth: 0 }}
-              autoFocus
             />
             <select
               className="select"
@@ -307,9 +378,20 @@ export default function POSPage() {
                   </div>
                 </div>
                 <div className="qty-ctl">
-                  <button className="qty-btn" onClick={() => cart.setQty(l.productId, l.quantity - 1)}>−</button>
-                  <span style={{ width: 28, textAlign: 'center', fontWeight: 700 }}>{l.quantity}</span>
-                  <button className="qty-btn" onClick={() => cart.setQty(l.productId, l.quantity + 1)}>+</button>
+                  <button className="qty-btn" onClick={() => bumpQty(l.productId, -1)}>−</button>
+                  <input
+                    className="qty-input"
+                    inputMode="numeric"
+                    value={qtyTexts[l.productId] ?? String(l.quantity)}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      setQtyTexts((t) => ({ ...t, [l.productId]: raw }));
+                      const n = parseInt(raw, 10);
+                      if (!Number.isNaN(n)) cart.setQty(l.productId, n);
+                    }}
+                    onBlur={() => setQtyTexts((t) => ({ ...t, [l.productId]: String(l.quantity) }))}
+                  />
+                  <button className="qty-btn" onClick={() => bumpQty(l.productId, +1)}>+</button>
                 </div>
                 <div style={{ fontWeight: 800, minWidth: 70, textAlign: 'right' }}>{fmtMoney(l.unitPrice * l.quantity)}</div>
               </div>
@@ -352,7 +434,7 @@ export default function POSPage() {
                 <button
                   key={m}
                   className={`pay-method ${cart.activePayment === m ? 'active' : ''}`}
-                  onClick={() => cart.setActivePayment(m)}
+                  onClick={() => switchPayment(m)}
                 >
                   {m === 'CASH' ? '💵 Cash' : m === 'CARD' ? '💳 Card' : m === 'PAYSTACK' ? '🟢 Paystack' : '📒 Credit'}
                 </button>
@@ -364,14 +446,14 @@ export default function POSPage() {
               <>
                 <input
                   className="input"
-                  placeholder="Cash tendered (GH₵)"
+                  placeholder="Cash Payable (GH₵)"
                   value={cashStr}
                   onChange={(e) => applyCash(e.target.value)}
                   inputMode="decimal"
                   style={{ marginBottom: 8 }}
                 />
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 8 }}>
-                  <span>Tendered</span>
+                  <span>Payable</span>
                   <span style={{ fontWeight: 800 }}>{fmtMoney(tendered)}</span>
                   <span>Change</span>
                   <span style={{ fontWeight: 800, color: 'var(--success)' }}>{fmtMoney(change)}</span>

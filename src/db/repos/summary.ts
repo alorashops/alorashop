@@ -107,19 +107,59 @@ export async function getTopSelling(shopId: string, limit = 8): Promise<DailySum
   return [...map.values()].sort((a, b) => b.qty - a.qty).slice(0, limit);
 }
 
-/** Top sellers within an inclusive date range (uses pre-aggregated summaries). */
-export async function getTopSellingRange(shopId: string, fromDate: string, toDate: string, limit = 8): Promise<DailySummary['topSelling']> {
+export interface TopSellingItem {
+  productId: string;
+  productName: string;
+  qty: number;
+  revenue: number;
+  /** Gross profit for the line (minor units). Present ONLY when a manager
+      backfill has attached costPriceAtSale to the underlying sales — otherwise
+      undefined so the UI can show "—" instead of a fake GH₵0. */
+  profit?: number;
+}
+
+/**
+ * Top sellers within an inclusive date range.
+ *
+ * Quantity/revenue come from the pre-aggregated summaries (never a raw-sale
+ * scan for those). Per-product PROFIT is the one thing summaries can't carry
+ * (they hold no line-level cost), so it is folded in from the raw sales where
+ * `costPriceAtSale` exists — i.e. after a manager backfill has run.
+ */
+export async function getTopSellingRange(shopId: string, fromDate: string, toDate: string, limit = 8): Promise<TopSellingItem[]> {
   const summaries = (await db.dailySummaries.where('shopId').equals(shopId).toArray())
     .filter((s) => s.date >= fromDate && s.date <= toDate);
-  const map = new Map<string, { productId: string; productName: string; qty: number; revenue: number }>();
+
+  const map = new Map<string, TopSellingItem>();
   for (const s of summaries) {
     for (const t of s.topSelling) {
-      const cur = map.get(t.productId) ?? { productId: t.productId, productName: t.productName, qty: 0, revenue: 0 };
+      const cur = map.get(t.productId) ?? { productId: t.productId, productName: t.productName, qty: 0, revenue: 0, profit: undefined };
       cur.qty += t.qty;
       cur.revenue += t.revenue;
       map.set(t.productId, cur);
     }
   }
+
+  const start = new Date(`${fromDate}T00:00:00`).getTime();
+  const end = new Date(`${toDate}T23:59:59.999`).getTime();
+  const sales = await db.sales
+    .where('shopId')
+    .equals(shopId)
+    .and((s) => s.createdAt >= start && s.createdAt <= end && !s.voidedBy)
+    .toArray();
+
+  for (const sale of sales) {
+    for (const it of sale.items) {
+      if (it.costPriceAtSale === undefined || it.costPriceAtSale === null) continue;
+      let cur = map.get(it.productId);
+      if (!cur) {
+        cur = { productId: it.productId, productName: it.productName, qty: 0, revenue: 0, profit: undefined };
+        map.set(it.productId, cur);
+      }
+      cur.profit = (cur.profit ?? 0) + (it.unitPrice - it.costPriceAtSale) * it.quantity;
+    }
+  }
+
   return [...map.values()].sort((a, b) => b.qty - a.qty).slice(0, limit);
 }
 
