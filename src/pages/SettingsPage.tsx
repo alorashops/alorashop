@@ -249,17 +249,13 @@ export default function SettingsPage() {
               It will then open full-screen like a native app, with the AloraShop icon.
             </p>
           </div>
-        ) : installState.canInstall ? (
+        ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-start' }}>
             <p style={{ margin: 0, fontSize: 13 }}>Install AloraShop to open it full-screen like a native app.</p>
             <button className="btn btn-primary" onClick={() => void promptInstall()}>
               📲 Install AloraShop
             </button>
           </div>
-        ) : (
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
-            Open this app in <strong>Chrome</strong> (Android) or <strong>Safari</strong> (iPhone) for install options.
-          </p>
         )}
       </div>
 

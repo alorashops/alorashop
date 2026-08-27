@@ -9,6 +9,7 @@ import { startSyncLoop } from './services/syncService';
 import { subscribeLowStock } from './stores/inventoryStore';
 import { Toasts, ConfirmDialog } from './components/overlays';
 import { ReceiptModal } from './components/ReceiptModal';
+import { InstallPromptPopup } from './components/InstallPromptPopup';
 import LoginPage from './pages/LoginPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 import POSPage from './pages/POSPage';
@@ -122,6 +123,9 @@ function Shell() {
           </Routes>
         </main>
       </div>
+      {/* Post-login install nudge — only when signed in and not already
+          installed as a PWA. Non-blocking: data loading continues behind it. */}
+      <InstallPromptPopup />
     </div>
   );
 }
