@@ -1,6 +1,8 @@
+
 import type { Sale } from '../types';
 import { fmtMoney, fmtDateTime } from '../lib/utils';
 import { DEFAULT_SHOP_NAME } from '../config/env';
+import { shopNameOf } from '../stores/shopStore';
 
 /**
  * Receipt printing.
@@ -10,7 +12,14 @@ import { DEFAULT_SHOP_NAME } from '../config/env';
  * 3. Digital: WhatsApp deep link / native share — free and device-side.
  */
 
-export async function printThermal(sale: Sale, shopName = DEFAULT_SHOP_NAME): Promise<boolean> {
+/** Effective shop name for a receipt — explicit arg wins, otherwise the
+    customized shop name from the store (falls back to the default when the
+    store hasn't loaded yet). */
+function effectiveShopName(explicit?: string): string {
+  return explicit?.trim() ? explicit.trim() : (shopNameOf() || DEFAULT_SHOP_NAME);
+}
+
+export async function printThermal(sale: Sale, shopName = effectiveShopName()): Promise<boolean> {
   // ESC/POS bytes: 80mm at ~32 chars/line. This is the 58mm-friendly core.
   const lines = buildReceiptLines(sale, shopName);
   const esc = [
@@ -51,7 +60,7 @@ async function requestPrinter(): Promise<PrinterDevice | null> {
   }
 }
 
-export function buildReceiptLines(sale: Sale, shopName = DEFAULT_SHOP_NAME): string[] {
+export function buildReceiptLines(sale: Sale, shopName = effectiveShopName()): string[] {
   const lines: string[] = [];
   lines.push(shopName);
   lines.push('Tel: 0302-000-000');
@@ -76,7 +85,7 @@ export function buildReceiptLines(sale: Sale, shopName = DEFAULT_SHOP_NAME): str
   return lines;
 }
 
-export function printCss(sale: Sale, shopName = DEFAULT_SHOP_NAME): boolean {
+export function printCss(sale: Sale, shopName = effectiveShopName()): boolean {
   const w = window.open('', '_blank', 'width=380,height=640');
   if (!w) return false;
   const body = buildReceiptLines(sale, shopName)
@@ -96,7 +105,7 @@ export function printCss(sale: Sale, shopName = DEFAULT_SHOP_NAME): boolean {
 }
 
 /** Digital receipt — WhatsApp deep link (free, device-side, no SMS cost). */
-export function digitalReceipt(sale: Sale, phone?: string, shopName = DEFAULT_SHOP_NAME): void {
+export function digitalReceipt(sale: Sale, phone?: string, shopName = effectiveShopName()): void {
   const text = encodeURIComponent(buildReceiptLines(sale, shopName).join('\n'));
   const url = phone
     ? `https://wa.me/${phone.replace(/[^\d]/g, '')}?text=${text}`
@@ -104,7 +113,7 @@ export function digitalReceipt(sale: Sale, phone?: string, shopName = DEFAULT_SH
   window.open(url, '_blank');
 }
 
-export function shareReceipt(sale: Sale, shopName = DEFAULT_SHOP_NAME): void {
+export function shareReceipt(sale: Sale, shopName = effectiveShopName()): void {
   const text = buildReceiptLines(sale, shopName).join('\n');
   if (navigator.share) {
     void navigator.share({ title: `Receipt ${sale.receiptNumber}`, text }).catch(() => undefined);

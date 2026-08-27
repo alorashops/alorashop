@@ -2,13 +2,14 @@ import { useEffect, useState } from 'react';
 import { useAuthStore, canManageStaff, canAddManager } from '../stores/authStore';
 import { useSyncStore } from '../stores/syncStore';
 import { useUiStore } from '../stores/uiStore';
+import { useShopStore, MAX_SHOP_NAME } from '../stores/shopStore';
 import { db } from '../db';
 import { clearLocalData } from '../services/seedService';
 import { flushOutbox } from '../services/syncService';
 import { purgeLocalOnlyOutbox } from '../db/repos/outbox';
 import { addStaff, sendStaffInvite } from '../services/supabase';
 import { Modal } from '../components/ui';
-import { DEFAULT_SHOP_NAME, isSupabaseConfigured } from '../config/env';
+import { isSupabaseConfigured } from '../config/env';
 import { useInstallPrompt } from '../hooks/useInstallPrompt';
 import type { UserProfile, Role } from '../types';
 
@@ -44,6 +45,40 @@ export default function SettingsPage() {
   const [staffRole, setStaffRole] = useState<Role>('cashier');
   const [addingStaff, setAddingStaff] = useState(false);
   const { state: installState, promptInstall } = useInstallPrompt();
+
+  // Shop name — admin can edit; everyone sees it on the sidebar + receipts.
+  const shopName = useShopStore((s) => s.name);
+  const refreshShopName = useShopStore((s) => s.refresh);
+  const updateShopName = useShopStore((s) => s.updateName);
+  const canRename = user?.role === 'admin';
+  const [nameDraft, setNameDraft] = useState(shopName);
+  const [savingName, setSavingName] = useState(false);
+
+  // Keep the draft in sync when the authoritative name changes (initial load,
+  // account switch, or another device's rename pulled on refresh).
+  useEffect(() => { setNameDraft(shopName); }, [shopName]);
+  useEffect(() => { void refreshShopName(); }, [refreshShopName]);
+
+  const saveName = async () => {
+    const trimmed = nameDraft.trim();
+    if (!trimmed) {
+      toast.push('warn', 'Shop name cannot be empty.');
+      return;
+    }
+    if (trimmed.length > MAX_SHOP_NAME) {
+      toast.push('warn', `Keep it under ${MAX_SHOP_NAME} characters.`);
+      return;
+    }
+    setSavingName(true);
+    try {
+      const synced = await updateShopName(trimmed);
+      toast.push(synced ? 'success' : 'info', synced ? 'Shop name updated.' : 'Saved on this device — the cloud will confirm when it reconnects.');
+    } catch (err) {
+      toast.push('error', err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingName(false);
+    }
+  };
 
   const loadStaff = () => {
     void db.users.toArray().then(setStaff);
@@ -172,7 +207,34 @@ export default function SettingsPage() {
       <div className="grid" style={{ marginBottom: 16 }}>
         <div className="card">
           <div style={{ fontWeight: 800, marginBottom: 10 }}>Shop</div>
-          <div className="field"><label>Shop name</label><input className="input" defaultValue={DEFAULT_SHOP_NAME} /></div>
+          {canRename ? (
+            <div className="field">
+              <label>Shop name</label>
+              <input
+                className="input"
+                value={nameDraft}
+                maxLength={MAX_SHOP_NAME}
+                onChange={(e) => setNameDraft(e.target.value)}
+                placeholder="e.g. Mensah Provision Store"
+              />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, justifyContent: 'space-between' }}>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                  {nameDraft.length}/{MAX_SHOP_NAME} — used on the sidebar and receipts.
+                </span>
+                <button className="btn btn-sm btn-primary" onClick={() => void saveName()} disabled={savingName || nameDraft.trim() === shopName}>
+                  {savingName ? 'Saving…' : 'Save name'}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="field">
+              <label>Shop name</label>
+              <input className="input" value={shopName} readOnly />
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Only the shop admin can change the name.
+              </span>
+            </div>
+          )}
           <div className="field"><label>Shop ID</label><input className="input" value={user?.shopId ?? ''} readOnly /></div>
           <div className="field"><label>Signed in as</label><input className="input" value={`${user?.displayName} (${user?.role})`} readOnly /></div>
         </div>

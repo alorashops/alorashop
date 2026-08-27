@@ -3,6 +3,7 @@ import { HashRouter, Routes, Route, Navigate, NavLink } from 'react-router-dom';
 import { useAuthStore, shopIdOf } from './stores/authStore';
 import { useSyncStore } from './stores/syncStore';
 import { useInventoryStore } from './stores/inventoryStore';
+import { useShopStore } from './stores/shopStore';
 
 import { seedIfEmpty, purgeDemoData } from './services/seedService';
 import { startSyncLoop } from './services/syncService';
@@ -35,8 +36,9 @@ function Shell() {
   const pending = useSyncStore((s) => s.pending);
   const failed = useSyncStore((s) => s.failed);
   const localOnly = useSyncStore((s) => s.localOnly);
-      const lastError = useSyncStore((s) => s.lastError);
-      const lowStock = useInventoryStore((s) => s.lowStock.length);
+  const lastError = useSyncStore((s) => s.lastError);
+  const lowStock = useInventoryStore((s) => s.lowStock.length);
+  const shopName = useShopStore((s) => s.name);
 
   // Sidebar drawer — toggleable via the ☰ button in the topbar.
   // Open by default on wide screens; on small screens the sidebar is hidden
@@ -54,6 +56,14 @@ function Shell() {
     if (window.innerWidth <= 1000) setSidebarOpen(false);
   };
 
+  // Keep the sidebar brand in sync with the shop name. Re-fetches whenever
+  // the signed-in shop changes (login, create-shop, switch, revalidation) —
+  // the cloud name wins when reachable, otherwise the cached/default name.
+  const shopId = user?.shopId;
+  useEffect(() => {
+    if (shopId) void useShopStore.getState().refresh();
+  }, [shopId]);
+
   // No session, or session without a shop yet -> auth/create-shop flow.
   if (!user || !user.shopId) return <Navigate to="/login" replace />;
 
@@ -61,8 +71,9 @@ function Shell() {
     <div className={`app-shell${sidebarOpen ? ' sidebar-open' : ' sidebar-closed'}`}>
       {sidebarOpen && <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />}
       <aside className="sidebar">
-        <div className="brand">
-          <span className="logo">A</span> AloraShop
+        <div className="brand" title={shopName}>
+          <span className="logo">{shopName.trim().charAt(0).toUpperCase() || 'A'}</span>
+          <span className="brand-name">{shopName}</span>
         </div>
         <nav className="nav" onClick={handleNavClick}>
           <NavBadge path="/pos" label="Checkout" icon="🛒" />

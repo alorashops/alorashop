@@ -26,6 +26,11 @@ import { buildCloudRows, upsertCloudRows, pullCloudChanges, type PulledChange } 
  * - Never blocks or slows checkout: if offline, entries simply stay queued.
  */
 let running = false;
+/** Pull re-entrancy guard: a single large drain now spans many paged requests
+    (could exceed the 15s tick), so an overlapping pull must be skipped rather
+    than started — it would double quota reads and cause redundant refreshes.
+    Mirrors the `running` guard on flushOutbox. */
+let pullRunning = false;
 
 export async function flushOutbox(force = false): Promise<number> {
   if (running && !force) return 0;
@@ -108,7 +113,9 @@ export async function flushOutbox(force = false): Promise<number> {
 
 /** Delta sync: pull only rows changed since the device cursor. */
 export async function pullDelta(): Promise<void> {
+  if (pullRunning) return; // already draining — skip the overlap
   if (!isSupabaseConfigured || !(await isOnline())) return;
+  pullRunning = true; // set before the first await so overlapping ticks bail
   try {
     const cursor = await getSyncCursor();
     const changes = await pullCloudChanges(cursor);
@@ -150,6 +157,8 @@ export async function pullDelta(): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     useSyncStore.getState().markSyncError(msg);
     await useSyncStore.getState().refresh();
+  } finally {
+    pullRunning = false; // always reset — an error must not strand the guard
   }
 }
 

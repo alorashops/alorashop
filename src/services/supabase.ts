@@ -13,6 +13,32 @@ import {
 import { supabaseUrl, supabaseAnonKey, isSupabaseConfigured } from '../config/env';
 import type { Role } from '../types';
 
+/**
+ * Fetches this shop's display name from the cloud `shops` table (RLS-scoped:
+ * only shop members can read it). Used to refresh the cached brand name.
+ * Returns null when the shop row is missing.
+ */
+export async function fetchShopName(shopId: string): Promise<string | null> {
+  const sb = await getSupabase();
+  const { data, error } = await sb
+    .from('shops')
+    .select('name')
+    .eq('id', shopId)
+    .maybeSingle();
+  if (error) throw error;
+  return (data as { name?: string } | null)?.name ?? null;
+}
+
+/**
+ * Renames the shop via the SECURITY DEFINER `update_shop_name` RPC. The server
+ * enforces: admin-only, non-empty, ≤ 40 chars. Throws on any violation.
+ */
+export async function updateShopName(newName: string): Promise<void> {
+  const sb = await getSupabase();
+  const { error } = await sb.rpc('update_shop_name', { new_name: newName });
+  if (error) throw error;
+}
+
 let clientPromise: Promise<SupabaseClient> | undefined;
 
 /** Lazily build the shared client. Throws if .env is not configured. */

@@ -4,7 +4,6 @@ import { useUiStore } from '../stores/uiStore';
 import { getSaleById } from '../db/repos/sales';
 import { buildReceiptLines, printThermal, printCss, digitalReceipt, shareReceipt } from '../services/printService';
 import { fmtMoney } from '../lib/utils';
-import { DEFAULT_SHOP_NAME } from '../config/env';
 import type { Sale } from '../types';
 
 export function ReceiptModal() {
@@ -39,8 +38,8 @@ export function ReceiptModal() {
         </div>
       )}
       <div style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
-        <button className="btn btn-primary" onClick={() => void printThermal(sale, DEFAULT_SHOP_NAME)}>🖨️ Print</button>
-        <button className="btn btn-secondary" onClick={() => printCss(sale, DEFAULT_SHOP_NAME)}>CSS Print</button>
+        <button className="btn btn-primary" onClick={() => void printThermal(sale)}>🖨️ Print</button>
+        <button className="btn btn-secondary" onClick={() => printCss(sale)}>CSS Print</button>
         <button className="btn btn-secondary" onClick={() => digitalReceipt(sale)}>📱 WhatsApp</button>
         <button className="btn btn-secondary" onClick={() => shareReceipt(sale)}>Share</button>
         <button className="btn btn-ghost" onClick={close} style={{ marginLeft: 'auto' }}>Close</button>

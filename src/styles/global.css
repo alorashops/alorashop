@@ -66,6 +66,11 @@ input, select { font-family: inherit; }
   background: linear-gradient(135deg, #6366f1, #8b5cf6);
   display: grid; place-items: center; font-size: 15px;
 }
+/* Long shop names: ellipsis + full-name tooltip (set as title on .brand) so
+   a 40-char name never widens or wraps the sidebar. */
+.sidebar .brand .brand-name {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
 .nav { padding: 10px; display: flex; flex-direction: column; gap: 2px; flex: 1; overflow-y: auto; }
 .nav a {
   display: flex; align-items: center; gap: 10px;
