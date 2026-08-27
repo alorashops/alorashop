@@ -16,7 +16,6 @@ export default defineConfig({
         theme_color: '#0f172a',
         background_color: '#f1f5f9',
         display: 'standalone',
-        orientation: 'landscape',
         start_url: '/',
         icons: [
           { src: 'alora-icon-192.png', sizes: '192x192', type: 'image/png' },
