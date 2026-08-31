@@ -13,6 +13,9 @@ import { isRetryableError } from '../lib/idempotency';
 import { isSupabaseConfigured } from '../config/env';
 import { useSyncStore } from '../stores/syncStore';
 import { useInventoryStore } from '../stores/inventoryStore';
+import { useAuthStore, shopIdOf, canSeeCosting } from '../stores/authStore';
+import { todayKey } from '../lib/utils';
+import { autoBackfillProfit } from '../db/repos/summary';
 import { buildCloudRows, upsertCloudRows, pullCloudChanges, type PulledChange } from './supabaseSync';
 
 /**
@@ -142,6 +145,36 @@ export async function pullDelta(): Promise<void> {
       } catch {
         // Cursor already advanced — non-fatal for the pull itself.
       }
+      // AUTO-PROFIT (Problem #4): when a pull delivered a SALE/VOID row, sales
+      // may just have arrived from cashier devices (profit-less, the common
+      // 80%). A device with cost access (manager/admin) gap-fills profit onto
+      // them so cashier sales show profit everywhere WITHOUT the manual button.
+      //
+      // Why this is safe at-scale and never a "global every-15s":
+      //  - Gated on canSeeCosting -> cashier devices NEVER enter this block.
+      //  - It only runs when a sale-related row was actually applied, not on
+      //    product-only pulls or quiet ticks.
+      //  - Internally idempotent (backfillSalesWindow skips already-enriched
+      //    sales): after the first run the steady state is a read-only scan
+      //    that writes/enqueues NOTHING, so cost-access devices at steady
+      //    state are no-ops too.
+      // Best-effort: a failure here must never abort or fail the pull — the
+      // payload is already applied and the cursor already advanced; the next
+      // pull/load retries the gap-fill.
+      if (
+        canSeeCosting(useAuthStore.getState().user?.role) &&
+        applied.some((c) => c.entityType === 'SALE' || c.entityType === 'VOID')
+      ) {
+        try {
+          // Recent 7-day window — covers the default Analytics range so the
+          // numbers a manager sees with zero clicks are already enriched.
+          const to = todayKey();
+          const from = todayKey(new Date(Date.now() - 6 * 86_400_000));
+          await autoBackfillProfit(shopIdOf(), from, to);
+        } catch {
+          // non-fatal — retried on the next pull/load
+        }
+      }
     }
     // A successful pull proves the cloud is reachable — clear any previously
     // surfaced pull error so a transient failure doesn't stick forever.
@@ -181,6 +214,46 @@ async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[
     return out;
   };
 
+  // Newest version stamp carried by a canonical doc. Mirrors rowUpdatedAt()
+  // in db.ts but omits lastAttemptAt (no outbox payload carries it): summaries
+  // stamp with lastUpdatedAt, products/customers/costing with updatedAt, and
+  // the rest with createdAt.
+  const versionOf = (doc: Record<string, unknown>): number => {
+    for (const k of ['updatedAt', 'lastUpdatedAt', 'createdAt']) {
+      const v = doc[k];
+      if (typeof v === 'number') return v;
+    }
+    return 0;
+  };
+
+  /** A pulled doc may never silently erase a newer local copy. Returns true
+      when the row was fully handled (applied OR deliberately kept local), so
+      the pull cursor still advances past it instead of re-pulling forever. */
+  const keepLocalIfNotOlder = async (
+    getLocal: (key: string) => Promise<unknown>,
+    key: string,
+    payload: Record<string, unknown>
+  ): Promise<boolean> => {
+    let local: unknown;
+    try {
+      local = await getLocal(key);
+    } catch {
+      local = undefined;
+    }
+    if (local === undefined || local === null) return false; // nothing local — apply the cloud row
+    const localV = versionOf(local as Record<string, unknown>);
+    const pulledV = versionOf(payload);
+    if (localV > pulledV) return true; // local is genuinely newer — keep it
+    if (localV === pulledV) {
+      // Same stamp: the cloud copy is interchangeable EXCEPT it can never
+      // carry this device's local-only enrichment (profit backfill). See the
+      // SALE case for the merge. For pure doc tables an equal-stamp cloud row
+      // is a byte-identical no-op — skip the write.
+      return true;
+    }
+    return false; // cloud row is newer — apply it
+  };
+
   for (const change of changes) {
     const raw = change.payload as Record<string, unknown> & { id?: string; productId?: string };
     // Costing docs are keyed by `productId`, everything else by `id`.
@@ -195,26 +268,74 @@ async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[
     }
 
     switch (change.entityType) {
-      case 'PRODUCT':
+      case 'PRODUCT': {
+        const key = String(payload.id);
+        if (await keepLocalIfNotOlder((k) => db.products.get(k), key, payload)) break;
         await db.products.put(payload as never);
         break;
-      case 'PRODUCT_COSTING':
+      }
+      case 'PRODUCT_COSTING': {
+        const key = String(payload.productId);
+        if (await keepLocalIfNotOlder((k) => db.productCosting.get(k), key, payload)) break;
         await db.productCosting.put(payload as never);
         break;
+      }
       case 'SALE':
-      case 'VOID':
+      case 'VOID': {
+        const key = String(payload.id);
+        const local = await db.sales.get(key).catch(() => undefined);
+        if (local) {
+          const localV = versionOf(local as unknown as Record<string, unknown>);
+          const pulledV = versionOf(payload);
+          if (localV > pulledV) break; // local (freshly backfilled/edited) wins
+          if (localV === pulledV) {
+            // Same stamp — the cloud copy is the same sale, but it was pushed
+            // from a device that never ran a manager backfill, so it carries
+            // NO profit. A plain put() would strip the profit THIS device
+            // already computed locally (the "some devices show only profit,
+            // some don't" bug). Fold the local-only enrichment back in, then
+            // write the merged row so the cloud copy never destructively
+            // overwrites it.
+            if (local.profit !== undefined && payload.profit === undefined) {
+              payload.profit = local.profit;
+            }
+            if (Array.isArray(payload.items) && local.items.length > 0) {
+              const localCosts = new Map<string, number>();
+              for (const it of local.items) {
+                if (typeof it.costPriceAtSale === 'number') localCosts.set(it.productId, it.costPriceAtSale);
+              }
+              if (localCosts.size > 0) {
+                for (const it of payload.items as Array<Record<string, unknown>>) {
+                  const productId = it.productId;
+                  if (typeof productId === 'string' && localCosts.has(productId) && it.costPriceAtSale === undefined) {
+                    it.costPriceAtSale = localCosts.get(productId);
+                  }
+                }
+              }
+            }
+          }
+        }
         await db.sales.put(payload as never);
         break;
+      }
       case 'RESTOCK':
+        // Append-only movements with unique ids — a plain idempotent put.
         await db.stockLedger.put(payload as never);
         break;
-      case 'DAILY_SUMMARY':
+      case 'DAILY_SUMMARY': {
+        const key = String(payload.id);
+        if (await keepLocalIfNotOlder((k) => db.dailySummaries.get(k), key, payload)) break;
         await db.dailySummaries.put(payload as never);
         break;
-      case 'CUSTOMER':
+      }
+      case 'CUSTOMER': {
+        const key = String(payload.id);
+        if (await keepLocalIfNotOlder((k) => db.customers.get(k), key, payload)) break;
         await db.customers.put(payload as never);
         break;
+      }
       case 'CREDIT_LEDGER':
+        // Append-only movements with unique ids — a plain idempotent put.
         await db.creditLedger.put(payload as never);
         break;
       default:

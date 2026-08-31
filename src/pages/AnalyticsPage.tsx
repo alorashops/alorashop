@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useAuthStore, shopIdOf, canSeeCosting } from '../stores/authStore';
 import { useUiStore } from '../stores/uiStore';
-import { getSummariesRange, getTopSellingRange, backfillProfits, getStockValue, type TopSellingItem } from '../db/repos/summary';
+import { getSummariesRange, getTopSellingRange, backfillProfits, autoBackfillProfit, getStockValue, type TopSellingItem } from '../db/repos/summary';
 import { fmtMoneyCompact, todayKey, pct } from '../lib/utils';
 import { EmptyState } from '../components/ui';
 import type { DailySummary } from '../types';
@@ -23,13 +23,32 @@ export default function AnalyticsPage() {
   const [topSelling, setTopSelling] = useState<TopSellingItem[]>([]);
   const [stockValue, setStockValue] = useState<{ count: number; value: number }>({ count: 0, value: 0 });
   const [backfilling, setBackfilling] = useState(false);
+  /** Monotonic load id — a slow OLD load must never overwrite a NEWER one
+      (the classic stale-response race when Refresh/date-change fire fast). */
+  const loadSeq = useRef(0);
 
   const load = async (from = fromDate, to = toDate) => {
+    const seq = ++loadSeq.current;
+    // AUTO-PROFIT (Problem #4): before aggregating, gap-fill profit onto any
+    // profit-less sales in the viewed range so cashier sales (the common 80%)
+    // show profit with zero clicks. Reads the LIVE role from the store so a
+    // role change never leaves a stale `seeProfit` writable closure. Internally
+    // gated on canSeeCosting + idempotent, so a cashier device is a no-op and
+    // a manager device at steady state is a cheap read-only pass. Best-effort:
+    // a failure here must never hide the page — it renders with what exists.
+    if (canSeeCosting(useAuthStore.getState().user?.role)) {
+      try {
+        await autoBackfillProfit(shopIdOf(), from, to);
+      } catch {
+        // non-fatal — render with currently-known profit
+      }
+    }
     const [sum, top, sv] = await Promise.all([
       getSummariesRange(shopIdOf(), from, to),
       getTopSellingRange(shopIdOf(), from, to, 8),
       getStockValue(shopIdOf())
     ]);
+    if (seq !== loadSeq.current) return; // stale — a newer load superseded us
     setSummaries(sum);
     setTopSelling(top);
     setStockValue(sv);
@@ -81,14 +100,14 @@ export default function AnalyticsPage() {
         <div>
           <h1 className="page-title">Analytics</h1>
           <p className="page-sub">
-            Dashboards read pre-aggregated dailySummary documents — never raw sale scans. Pick a date range.
+            Aggregates are derived from the synced sales ledger, so every device converges on the same numbers. Pick a date range.
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-secondary" onClick={() => void load()}>↻ Refresh</button>
           {seeProfit && (
             <button className="btn btn-primary" onClick={() => void doBackfill()} disabled={backfilling}>
-              {backfilling ? 'Backfilling…' : 'Run profit backfill'}
+              {backfilling ? 'Recomputing…' : 'Recompute profit'}
             </button>
           )}
         </div>
@@ -125,7 +144,7 @@ export default function AnalyticsPage() {
           <div className="card stat">
             <div className="label">Profit</div>
             <div className="value" style={{ color: 'var(--success)' }}>{fmtMoneyCompact(profit)}</div>
-            <div className="sub">Manager backfill required</div>
+            <div className="sub">Auto-computed on manager/admin devices</div>
           </div>
         )}
         <div className="card stat">
@@ -187,9 +206,9 @@ export default function AnalyticsPage() {
                             fontWeight: 800,
                             color: t.profit === undefined ? 'var(--text-muted)' : t.profit < 0 ? 'var(--danger)' : 'var(--success)'
                           }}
-                          title={t.profit !== undefined ? 'Gross profit after backfill' : 'Backfill to see per-product profit'}
+                          title={t.profit !== undefined ? 'Gross profit after cost computation' : 'Profit appears once a manager device computes cost (automatic)'}
                         >
-                          {t.profit === undefined ? '—' : `+${fmtMoneyCompact(t.profit)}`}
+                          {t.profit === undefined ? '—' : t.profit < 0 ? `−${fmtMoneyCompact(-t.profit)}` : `+${fmtMoneyCompact(t.profit)}`}
                         </span>
                       )}
                     </span>
@@ -217,10 +236,11 @@ export default function AnalyticsPage() {
 
       {seeProfit && (
         <div className="card" style={{ background: 'var(--surface-2)' }}>
-          <strong>Profit backfill (manager/admin only)</strong>
+          <strong>Profit & cost (automatic)</strong>
           <p style={{ margin: '6px 0 0', fontSize: 13, color: 'var(--text-muted)' }}>
-            Cashiers write sales with selling-price snapshots only. A manager device computes cost of goods and writes
-            profit locally — profit fields never travel through a cashier device.
+            Sales are written with selling-price snapshots only, by any device. A device with cost access (manager/admin)
+            automatically computes profit in the background — locally and, via sync, for every other device — so cashier
+            sales show profit with zero clicks. "Recompute profit" force-rebuilds the calculation with current costs.
           </p>
         </div>
       )}

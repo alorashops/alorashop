@@ -51,7 +51,11 @@ export type { CloudEntity as CloudEntityType };
 const ENTITY_MAP: Record<CloudEntity, { table: string; data: (p: any) => Record<string, unknown>; ts: (p: any) => number }> = {
   SALE: {
     table: 'sales',
-    ts: (p) => p.createdAt,
+    // `updatedAt` is stamped when a manager profit backfill enriches the row.
+    // Preferring it advances the cloud `updated_at` past every device's cursor,
+    // so re-pushing an enriched sale re-delivers it on the next delta pull and
+    // profit converges on devices that never ran the backfill. (Problem #3.)
+    ts: (p) => p.updatedAt ?? p.createdAt,
     data: (p) => p
   },
   VOID: {

@@ -91,7 +91,14 @@ export interface Sale {
   createdAt: number;
   voidedBy?: string; // reversal doc id, if any
   // --- manager backfill (profit) ---
+  /** Gross profit for the whole sale — attached by a manager profit backfill.
+      Restricted data: only the device that ran the backfill has it. */
   profit?: number;
+  /** Set when a manager profit backfill enriched this row. Drives delta-sync
+      propagation: `supabaseSync` stamps the cloud `updated_at` with this when
+      present (falling back to `createdAt`), so re-pushing an enriched sale
+      advances the watermark and every other device's pull picks the profit up. */
+  updatedAt?: number;
   // --- local-only sync metadata (never synced as-is to the cloud) ---
   syncedToCloud: boolean;
   outboxRetryCount: number;

@@ -1,6 +1,7 @@
 import { db } from '../db';
 import { uid } from '../../lib/utils';
 import { enqueueStockLedger } from './outbox';
+import { applyWeightedAverageCost } from './summary';
 import type { Product, ProductCosting } from '../../types';
 
 /**
@@ -192,14 +193,17 @@ export async function restockProduct(
   productId: string,
   quantity: number,
   actorId: string,
-  note?: string
+  note?: string,
+  /** Optional purchase unit cost (minor units). When provided, the weighted
+      average cost (WAC) is updated — see below for why that matters. */
+  unitCost?: number
 ): Promise<void> {
   const now = Date.now();
   const qty = Math.round(quantity);
   if (qty <= 0) throw new Error('Restock quantity must be positive');
   const restockId = uid();
 
-  await db.transaction('rw', db.products, db.stockLedger, db.outbox, async () => {
+  await db.transaction('rw', db.products, db.productCosting, db.stockLedger, db.outbox, async () => {
     const product = await db.products.get(productId);
     if (!product) throw new Error('Product not found');
     const next: Product = { ...product, stockQuantity: product.stockQuantity + qty, updatedAt: now };
@@ -215,30 +219,53 @@ export async function restockProduct(
       createdAt: now
     });
     await db.outbox.add({
-      id: uid(),
-              idempotencyKey: `restock_${restockId}`,
-              entityType: 'RESTOCK',
-              // Must carry `type` — the cloud row round-trips into a local
-              // StockLedgerEntry on other devices via db.stockLedger.put(payload);
-              // omitting it (as it was) silently stored a ledger entry with
-              // `type: undefined` on every device except the one that restocked.
-              payload: { id: restockId, productId, type: 'RESTOCK', quantityDelta: qty, referenceId: restockId, actorId, shopId, createdAt: now, note },
-      status: 'PENDING',
-      retryCount: 0,
-      createdAt: now
-    });
-    // Coalesce product doc flush too (stock change must reach the cloud).
-    await db.outbox.add({
-      id: uid(),
-      idempotencyKey: `product_${productId}`,
-      entityType: 'PRODUCT',
-      payload: next,
-      status: 'PENDING',
-      retryCount: 0,
-      createdAt: now
-    });
-  });
-}
+          id: uid(),
+          idempotencyKey: `restock_${restockId}`,
+                  entityType: 'RESTOCK',
+                  // Must carry `type` — the cloud row round-trips into a local
+                  // StockLedgerEntry on other devices via db.stockLedger.put(payload);
+                  // omitting it (as it was) silently stored a ledger entry with
+                  // `type: undefined` on every device except the one that restocked.
+                  payload: { id: restockId, productId, type: 'RESTOCK', quantityDelta: qty, referenceId: restockId, actorId, shopId, createdAt: now, note },
+          status: 'PENDING',
+          retryCount: 0,
+          createdAt: now
+        });
+        // Weighted-average cost update — the restock modal has ALWAYS promised this,
+        // but applyWeightedAverageCost() was dead code: restockProduct() never called
+        // it, so WAC silently trailed reality after every restock. The stale cost
+        // then fed stock value (getStockValue, WAC-based) and profit backfill on
+        // every device. Wire it when a purchase unit cost is supplied (Finding 1
+        // secondary gap). Dexie nests this within the active transaction, so the
+        // costing write commits atomically with the restock.
+        if (typeof unitCost === 'number' && unitCost > 0) {
+          await applyWeightedAverageCost(productId, qty, unitCost);
+          const costing = await db.productCosting.where('productId').equals(productId).first();
+          if (costing) {
+            await db.outbox.add({
+              id: uid(),
+              idempotencyKey: `product_costing_${productId}`,
+              entityType: 'PRODUCT_COSTING',
+              // Tenant key: legacy rows predate shopId — backfill from the caller.
+              payload: { ...costing, shopId: costing.shopId ?? shopId, updatedAt: now },
+              status: 'PENDING',
+              retryCount: 0,
+              createdAt: now
+            });
+          }
+        }
+        // Coalesce product doc flush too (stock change must reach the cloud).
+        await db.outbox.add({
+          id: uid(),
+          idempotencyKey: `product_${productId}`,
+          entityType: 'PRODUCT',
+          payload: next,
+          status: 'PENDING',
+          retryCount: 0,
+          createdAt: now
+        });
+      });
+    }
 
 /**
  * Delete = archive, always.

@@ -30,6 +30,9 @@ export default function InventoryPage() {
   const [costDirty, setCostDirty] = useState(false);
   const [restockId, setRestockId] = useState<string | null>(null);
   const [restockQty, setRestockQty] = useState('10');
+  /** Optional purchase unit cost for a restock — drives the weighted-average
+      cost (WAC) update. Blank = keep the current cost basis. */
+  const [restockCost, setRestockCost] = useState('');
 
   const manage = canManageInventory(user?.role);
   const seeCost = canSeeCosting(user?.role);
@@ -135,9 +138,10 @@ export default function InventoryPage() {
       return;
     }
     try {
-      await restockProduct(shopIdOf(), p.id, qty, user?.uid ?? 'mgr-1');
-      toast.push('success', `${p.name} restocked +${qty}`);
+      await restockProduct(shopIdOf(), p.id, qty, user?.uid ?? 'mgr-1', undefined, restockCost ? parseMoneyInput(restockCost) : undefined);
+      toast.push('success', `${p.name} restocked +${qty}${restockCost ? ' (WAC updated)' : ''}`);
       setRestockId(null);
+      setRestockCost('');
       void reload();
     } catch (err) {
       toast.push('error', err instanceof Error ? err.message : String(err));
@@ -208,7 +212,7 @@ export default function InventoryPage() {
                       <td>
                         <div style={{ display: 'flex', gap: 6 }}>
                           <button className="btn btn-sm btn-secondary" onClick={() => openEdit(p)}>Edit</button>
-                          <button className="btn btn-sm btn-success" onClick={() => setRestockId(p.id)}>Restock</button>
+                          <button className="btn btn-sm btn-success" onClick={() => { setRestockId(p.id); setRestockCost(''); }}>Restock</button>
                           <button
                             className="btn btn-sm btn-ghost"
                             style={{ color: 'var(--danger)' }}
@@ -376,12 +380,24 @@ export default function InventoryPage() {
         {restockId && (
           <div onKeyDown={onFormKeyDown}>
             <div className="modal-sub">
-              {products.find((p) => p.id === restockId)?.name} — adds an append-only RESTOCK ledger entry + weighted-average cost update.
+              {products.find((p) => p.id === restockId)?.name} — adds an append-only RESTOCK ledger entry. Enter a cost per unit to update the weighted-average cost (WAC); leave blank to keep the current cost basis.
             </div>
             <div className="field">
               <label>Quantity to add</label>
               <input className="input" type="number" value={restockQty} onChange={(e) => setRestockQty(e.target.value)} min={1} />
             </div>
+            {seeCost && (
+              <div className="field">
+                <label>Cost per unit (GH₵, optional)</label>
+                <input
+                  className="input"
+                  inputMode="decimal"
+                  value={restockCost}
+                  placeholder="Blank = keep current cost"
+                  onChange={(e) => setRestockCost(e.target.value)}
+                />
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
               <button className="btn btn-secondary" onClick={() => setRestockId(null)}>Cancel</button>
               <button className="btn btn-success" onClick={() => void doRestock(products.find((p) => p.id === restockId)!)}>Restock</button>

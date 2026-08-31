@@ -1,6 +1,7 @@
+
 import { db } from '../db';
 import { isCloudShopId, uid } from '../../lib/utils';
-import type { OutboxEntry, OutboxStatus, DailySummary, StockLedgerEntry } from '../../types';
+import type { OutboxEntry, OutboxStatus, DailySummary, StockLedgerEntry, Sale } from '../../types';
 
 const DEVICE_KEY = 'alorashop_device_id';
 
@@ -135,12 +136,6 @@ export async function markSaleSynced(saleId: string, outboxId: string): Promise<
   });
 }
 
-export async function markProductSynced(productId: string, outboxId: string): Promise<void> {
-  await db.transaction('rw', db.products, db.outbox, async () => {
-    await db.outbox.delete(outboxId);
-  });
-}
-
 /**
  * Enqueue a daily-summary doc to the cloud mirror.
  *
@@ -159,6 +154,45 @@ export async function enqueueDailySummary(summary: DailySummary): Promise<void> 
     idempotencyKey: `daily_summary_${summary.id}`,
     entityType: 'DAILY_SUMMARY',
     payload: summary,
+    status: 'PENDING',
+    retryCount: 0,
+    createdAt: Date.now()
+  });
+}
+
+/**
+ * Enqueue (or re-enqueue) a sale to the cloud mirror.
+ *
+ * SALE rows are keyed on the sale id and upserted ON CONFLICT (id), so a
+ * re-enqueue of the SAME sale simply updates the cloud row. This is the
+ * propagation path for a manager profit backfill: the originally-flushed row
+ * carried no profit (cashiers push selling-price snapshots only), so after
+ * attaching costPriceAtSale/profit locally we re-enqueue the enriched row with
+ * a NEWER `updatedAt`; `supabaseSync` stamps the cloud `updated_at` with that,
+ * which advances the watermark past every device's cursor so their delta pull
+ * re-delivers the row and the profit converges. (Problem #3.)
+ *
+ * If a PENDING entry for this sale is still queued (the sale never flushed), it
+ * is REPLACED rather than duplicated — a stale profit-less payload must never
+ * overwrite the enriched row after the fact.
+ *
+ * Demo shop (non-uuid) has no cloud account — skip like every other entity.
+ */
+export async function enqueueSale(sale: Sale): Promise<void> {
+  if (!sale || !isCloudShopId(sale.shopId)) return;
+  // Replace any still-queued SALE entry for this id (dedupe, never twice).
+  const pending = await db.outbox.where('status').equals('PENDING').toArray();
+  for (const e of pending) {
+    const p = (e.payload ?? {}) as { id?: unknown };
+    if (e.entityType === 'SALE' && p.id === sale.id) {
+      await db.outbox.delete(e.id);
+    }
+  }
+  await db.outbox.add({
+    id: uid(),
+    idempotencyKey: `sale_update_${sale.id}_${Date.now()}`,
+    entityType: 'SALE',
+    payload: sale,
     status: 'PENDING',
     retryCount: 0,
     createdAt: Date.now()

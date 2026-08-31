@@ -23,6 +23,11 @@ export default function POSPage() {
   /** False while the cash field is showing the empty/full-total default — set
       true the moment the cashier types, so the auto-fill stops overriding. */
   const [cashDirty, setCashDirty] = useState(false);
+  /** Mirrors cash: while the credit field shows its auto-filled default the
+      moment the cashier types (including a borrowing fee above the remainder)
+      the auto-fill stops and the typed value is stored as the CREDIT split. */
+  const [creditStr, setCreditStr] = useState('');
+  const [creditDirty, setCreditDirty] = useState(false);
   /** Raw quantity text per cart line — kept separate so the caret never jumps
       while typing a number (mirrors the price-field pattern on Inventory). */
   const [qtyTexts, setQtyTexts] = useState<Record<string, string>>({});
@@ -36,13 +41,22 @@ export default function POSPage() {
   const total = cartTotal(cart.lines, cart.discount);
   const tendered = cart.cashTendered;
   const change = changeDue(tendered, total);
-  // Store credit is DERIVED — the selected customer's tab covers whatever the
-  // other payment methods don't. No stored amount that can go stale mid-cart.
+  // The CREDIT split is STORED verbatim (like cash), never derived at the last
+  // second — so the typed tab amount, including any borrowing fee above the
+  // unpaid remainder, is exactly what's written to the ledger and analytics.
   const otherPayments = cart.payments.filter((p) => !(p.method === 'CREDIT' && p.customerId === cart.customerId));
   const paidSoFar = otherPayments.reduce((s, p) => s + p.amount, 0);
   const amountLeft = Math.max(0, total - paidSoFar);
-  const creditCovered = cart.customerId ? amountLeft : 0;
-  const remaining = Math.max(0, total - paidSoFar - creditCovered);
+  const storedCredit = cart.customerId
+    ? (cart.payments.find((p) => p.method === 'CREDIT' && p.customerId === cart.customerId)?.amount ?? 0)
+    : 0;
+  // CARD & PAYSTACK are auto-methods: while their tab is active they silently
+  // cover the remainder left AFTER any stored credit (so a kept tab split is
+  // never double-charged by an auto-method). Only one tab is active at a time.
+  const cardCoverage = cart.activePayment === 'CARD' ? Math.max(0, amountLeft - storedCredit) : 0;
+  const paystackCoverage = cart.activePayment === 'PAYSTACK' ? Math.max(0, amountLeft - storedCredit) : 0;
+  const creditCovered = storedCredit;
+  const remaining = Math.max(0, amountLeft - storedCredit - cardCoverage - paystackCoverage);
   const itemCount = cart.lines.reduce((n, l) => n + l.quantity, 0);
   const cartHasItems = cart.lines.some((l) => l.quantity > 0);
 
@@ -71,9 +85,18 @@ export default function POSPage() {
       toast.push('error', `Unpaid balance of ${fmtMoney(remaining)} — add payment first`);
       return;
     }
-    // Reconcile the final split at completion: the selected customer's tab
-    // covers whatever other methods didn't (derived live — never stale).
+    // Reconcile the final split at completion: stored splits are kept verbatim,
+    // the active auto-method (CARD/PAYSTACK) covers the leftover remainder, and
+    // the stored CREDIT split lands on the customer's tab as typed.
     let payments = otherPayments.filter((p) => p.amount > 0);
+    // Active-tab auto-methods materialize here — CARD/PAYSTACK silently charge
+    // the remainder (fast sale, no confirmation button).
+    if (cardCoverage > 0) {
+      payments = [...payments, { method: 'CARD', amount: cardCoverage }];
+    }
+    if (paystackCoverage > 0) {
+      payments = [...payments, { method: 'PAYSTACK', amount: paystackCoverage }];
+    }
     if (cart.customerId && creditCovered > 0) {
       payments = [...payments, { method: 'CREDIT', amount: creditCovered, customerId: cart.customerId }];
     }
@@ -119,6 +142,8 @@ export default function POSPage() {
       setStage('items');
       setCashStr('');
       setCashDirty(false);
+      setCreditStr('');
+      setCreditDirty(false);
       setDiscountStr('');
       setQtyTexts({});
       toast.push('success', `Sale complete — ${sale.receiptNumber}`);
@@ -153,6 +178,22 @@ export default function POSPage() {
   };
 
   /**
+   * Custom credit entry auto-applies as the user types (mirrors cash). The
+   * value is stored verbatim as the CREDIT split — fees above the remainder
+   * are kept. Clearing the field removes the split so nothing stale lingers.
+   */
+  const applyCredit = (v: string) => {
+    setCreditDirty(true);
+    setCreditStr(v);
+    const amt = parseMoneyInput(v);
+    if (amt > 0 && cart.customerId) {
+      cart.addPayment({ method: 'CREDIT', amount: amt, customerId: cart.customerId });
+    } else {
+      cart.removePayment('CREDIT');
+    }
+  };
+
+  /**
    * Payment-tab switching. The one subtlety: cash auto-fills with the full
    * total (just like CARD/PAYSTACK), so if the cashier switches to another
    * method WITHOUT typing a custom tender (`!cashDirty`), that default CASH
@@ -166,12 +207,25 @@ export default function POSPage() {
       cart.removePayment('CASH');
       setCashStr('');
     }
+    // Same rule for credit: an untouched auto-fill is dropped when switching
+    // away, a hand-typed tab amount is kept as a genuine split.
+    const leavingCredit = cart.activePayment === 'CREDIT' && m !== 'CREDIT';
+    if (leavingCredit && !creditDirty) {
+      cart.removePayment('CREDIT');
+      setCreditStr('');
+    }
     if (m === 'CASH') {
       // Returning to cash begins from a fresh full-total default.
       setCashDirty(false);
       setCashStr('');
       cart.setCashTendered(0);
       cart.removePayment('CASH');
+    }
+    if (m === 'CREDIT') {
+      // Returning to credit begins from a fresh unpaid-remainder default.
+      setCreditDirty(false);
+      setCreditStr('');
+      cart.removePayment('CREDIT');
     }
     cart.setActivePayment(m);
   };
@@ -191,6 +245,21 @@ export default function POSPage() {
     else cart.removePayment('CASH');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cart.activePayment, cashDirty, total]);
+
+  /**
+   * Credit auto-default: while the CREDIT tab is active with a customer picked
+   * and the cashier hasn't typed a custom tab amount, mirror the unpaid
+   * remainder into the field + CREDIT split. Deliberately keyed on `amountLeft`
+   * (which excludes CREDIT) so the split it writes can never retrigger it.
+   */
+  useEffect(() => {
+    if (cart.activePayment !== 'CREDIT' || creditDirty || !cart.customerId) return;
+    const amt = amountLeft;
+    setCreditStr(amt > 0 ? (amt / 100).toFixed(2) : '');
+    if (amt > 0) cart.addPayment({ method: 'CREDIT', amount: amt, customerId: cart.customerId });
+    else cart.removePayment('CREDIT');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cart.activePayment, creditDirty, cart.customerId, amountLeft]);
 
   /** Removes the most recently added cart line (mistake recovery). */
   const undoLast = () => {
@@ -234,6 +303,11 @@ export default function POSPage() {
       cart.removePayment('CASH');
       setCashStr('');
     }
+    // Fresh credit default for this customer — clears any prior tab split/state
+    // so the auto-fill re-arms for the unpaid remainder of this sale.
+    setCreditDirty(false);
+    setCreditStr('');
+    cart.removePayment('CREDIT');
     cart.setCustomerId(c.id);
     cart.setActivePayment('CREDIT');
     setCreditQuery('');
@@ -462,31 +536,43 @@ export default function POSPage() {
             )}
 
             {cart.activePayment === 'CARD' && (
-              <button
-                className="btn btn-secondary btn-block"
-                style={{ marginBottom: 8 }}
-                disabled={amountLeft <= 0}
-                onClick={() => {
-                  cart.addPayment({ method: 'CARD', amount: amountLeft });
-                  toast.push('info', 'Card payment queued — POS terminal prompt on device.');
+              <div
+                style={{
+
+                  border: '1px solid var(--border)',
+                  borderRadius: 8,
+                  padding: '10px',
+                  background: 'var(--surface-2)',
+                  marginBottom: 8,
+                  fontSize: 13,
+                  fontWeight: 700,
+                  textAlign: 'center',
+                  color: 'var(--text-muted)'
                 }}
               >
-                💳 Pay {fmtMoney(amountLeft)} with card
-              </button>
+                💳 Card {cardCoverage > 0 ? `will charge ${fmtMoney(cardCoverage)} at completion` : 'sale fully covered'}
+              </div>
             )}
 
             {cart.activePayment === 'PAYSTACK' && (
-              <button
-                className="btn btn-secondary btn-block"
-                style={{ marginBottom: 8 }}
-                disabled={amountLeft <= 0}
-                onClick={() => {
-                  cart.addPayment({ method: 'PAYSTACK', amount: amountLeft });
-                  toast.push('warn', 'Paystack marked PENDING_VERIFICATION — needs server verification (Spark limitation).');
+              <div
+                style={{
+                  border: '1px solid var(--border)',
+                  borderRadius: 8,
+                  padding: '10px',
+                  background: 'var(--surface-2)',
+                  marginBottom: 8,
+                  fontSize: 13,
+                  fontWeight: 700,
+                  textAlign: 'center',
+                  color: 'var(--text-muted)'
                 }}
               >
-                🟢 Pay {fmtMoney(amountLeft)} via Paystack
-              </button>
+                🟢 Paystack {paystackCoverage > 0 ? `will charge ${fmtMoney(paystackCoverage)} at completion` : 'sale fully covered'}
+                <div style={{ fontSize: 11, fontWeight: 500, marginTop: 4 }}>
+                  Sale is marked PENDING_VERIFICATION — needs server-side verification (Spark limitation).
+                </div>
+              </div>
             )}
 
             {cart.activePayment === 'CREDIT' && (
@@ -506,6 +592,8 @@ export default function POSPage() {
                         onClick={() => {
                           cart.clearCustomer();
                           cart.removePayment('CREDIT');
+                          setCreditDirty(false);
+                          setCreditStr('');
                         }}
                       >
                         ✕
@@ -547,17 +635,21 @@ export default function POSPage() {
                     )}
                   </>
                 )}
-                <button
-                  className="btn btn-secondary btn-block"
-                  disabled={!selectedCustomer}
-                  onClick={() => {
-                    if (!selectedCustomer) { toast.push('warn', 'Select a customer first'); return; }
-                    if (creditCovered <= 0) { toast.push('info', 'Nothing to put on the tab — sale is fully covered.'); return; }
-                    toast.push('success', `${fmtMoney(creditCovered)} on ${selectedCustomer.name}'s tab`);
-                  }}
-                >
-                  📒 Put {fmtMoney(creditCovered)} on {selectedCustomer ? selectedCustomer.name : "a customer's"} tab
-                </button>
+                {selectedCustomer && (
+                  <>
+                    <input
+                      className="input"
+                      placeholder="Tab amount (GH₵) — add any fee"
+                      value={creditStr}
+                      onChange={(e) => applyCredit(e.target.value)}
+                      inputMode="decimal"
+                      style={{ marginBottom: 8 }}
+                    />
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>
+                      Auto-filled with the unpaid balance — raise it to add the borrowing fee.
+                    </div>
+                  </>
+                )}
               </div>
             )}
 
