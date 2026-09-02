@@ -28,6 +28,9 @@ export default function POSPage() {
       the auto-fill stops and the typed value is stored as the CREDIT split. */
   const [creditStr, setCreditStr] = useState('');
   const [creditDirty, setCreditDirty] = useState(false);
+  /** True from the moment Complete Sale is accepted until the sale is written
+      — blocks double-taps from creating two sales (and double stock deduction). */
+  const [submitting, setSubmitting] = useState(false);
   /** Raw quantity text per cart line — kept separate so the caret never jumps
       while typing a number (mirrors the price-field pattern on Inventory). */
   const [qtyTexts, setQtyTexts] = useState<Record<string, string>>({});
@@ -77,8 +80,9 @@ export default function POSPage() {
   }, [products, query, category]);
 
   const completeSale = async () => {
-    if (cart.lines.length === 0) {
-      toast.push('warn', 'Cart is empty');
+    if (submitting) return;
+    if (!cartHasItems) {
+      toast.push('warn', 'Cart is empty — add items first');
       return;
     }
     if (remaining > 0) {
@@ -120,6 +124,7 @@ export default function POSPage() {
         ? 'CREDIT_OPEN'
         : 'PAID';
 
+    setSubmitting(true);
     try {
       const sale = await createSale({
         shopId: shopIdOf(),
@@ -151,6 +156,8 @@ export default function POSPage() {
       void refresh();
     } catch (err) {
       toast.push('error', `Checkout failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -238,13 +245,19 @@ export default function POSPage() {
    */
   useEffect(() => {
     if (cart.activePayment !== 'CASH' || cashDirty) return;
-    const amt = total;
+    // Auto-fill covers whatever isn't already on the sale as a KEPT credit
+    // split. Keyed on `total - storedCredit` — NOT `amountLeft` — so the CASH
+    // split this effect writes can never retrigger it (this effect only ever
+    // writes CASH, so `storedCredit` is stable across the write → no loop).
+    // Without this a typed credit + cash default double-counted the credit:
+    // e.g. 60 kept on tab + cash auto-filled 100 → 160 recorded on a 100 sale.
+    const amt = Math.max(0, total - storedCredit);
     setCashStr(amt > 0 ? (amt / 100).toFixed(2) : '');
     cart.setCashTendered(amt);
     if (amt > 0) cart.addPayment({ method: 'CASH', amount: amt });
     else cart.removePayment('CASH');
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cart.activePayment, cashDirty, total]);
+  }, [cart.activePayment, cashDirty, total, storedCredit]);
 
   /**
    * Credit auto-default: while the CREDIT tab is active with a customer picked
@@ -673,10 +686,12 @@ export default function POSPage() {
             <button
               className={`btn btn-lg btn-block ${remaining === 0 ? 'btn-success' : 'btn-primary'}`}
               onClick={() => void completeSale()}
+              disabled={submitting}
               style={{ marginTop: 10 }}
             >
-              ✔ Complete Sale — {fmtMoney(total)}
-              {remaining > 0 ? ` · due ${fmtMoney(remaining)}` : creditCovered > 0 ? ` · ${fmtMoney(creditCovered)} on tab` : ''}
+              {submitting
+                ? '⏳ Processing…'
+                : `✔ Complete Sale — ${fmtMoney(total)}${remaining > 0 ? ` · due ${fmtMoney(remaining)}` : creditCovered > 0 ? ` · ${fmtMoney(creditCovered)} on tab` : ''}`}
             </button>
             <p style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', margin: '8px 0 0' }}>
               Sale is durable in IndexedDB the instant you tap — cloud sync is backup only.

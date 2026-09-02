@@ -154,37 +154,11 @@ export default function AnalyticsPage() {
         </div>
       </div>
 
-      <div className="grid cols-2" style={{ marginBottom: 16 }}>
-        <div className="card">
-          <div style={{ fontWeight: 800, marginBottom: 12 }}>Revenue — {fromDate} to {toDate}</div>
-          {revenueByDay.length === 0 ? (
-            <EmptyState icon="📊" title="No data yet" />
-          ) : (
-            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, height: 160 }}>
-              {revenueByDay.map((s) => {
-                const max = Math.max(...revenueByDay.map((r) => r.totalRevenue), 1);
-                const h = Math.max(8, Math.round((s.totalRevenue / max) * 140));
-                return (
-                  <div key={s.date} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
-                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{fmtMoneyCompact(s.totalRevenue)}</div>
-                    <div
-                      title={s.date}
-                      style={{
-                        width: '100%',
-                        height: h,
-                        background: 'linear-gradient(180deg, #6366f1, #4f46e5)',
-                        borderRadius: '6px 6px 0 0',
-                        minWidth: 22
-                      }}
-                    />
-                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.date.slice(5)}</div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
+      {/* Top sellers first, each card on its OWN full-width row. On narrow
+          (phone) screens a side-by-side layout crushed the revenue bars and
+          could hide the top-sellers card entirely — stacked rows keep every
+          card visible at any width. */}
+      <div className="grid" style={{ marginBottom: 16 }}>
         <div className="card">
           <div style={{ fontWeight: 800, marginBottom: 12 }}>Top selling products</div>
           {topSelling.length === 0 ? (
@@ -230,6 +204,36 @@ export default function AnalyticsPage() {
                 </div>
               );
             })
+          )}
+        </div>
+
+        <div className="card">
+          <div style={{ fontWeight: 800, marginBottom: 12 }}>Revenue — {fromDate} to {toDate}</div>
+          {revenueByDay.length === 0 ? (
+            <EmptyState icon="📊" title="No data yet" />
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, height: 160 }}>
+              {revenueByDay.map((s) => {
+                const max = Math.max(...revenueByDay.map((r) => r.totalRevenue), 1);
+                const h = Math.max(8, Math.round((s.totalRevenue / max) * 140));
+                return (
+                  <div key={s.date} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{fmtMoneyCompact(s.totalRevenue)}</div>
+                    <div
+                      title={s.date}
+                      style={{
+                        width: '100%',
+                        height: h,
+                        background: 'linear-gradient(180deg, #6366f1, #4f46e5)',
+                        borderRadius: '6px 6px 0 0',
+                        minWidth: 22
+                      }}
+                    />
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.date.slice(5)}</div>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       </div>

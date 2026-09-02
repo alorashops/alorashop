@@ -1,4 +1,3 @@
-
 import type { Sale } from '../types';
 import { fmtMoney, fmtDateTime } from '../lib/utils';
 import { DEFAULT_SHOP_NAME } from '../config/env';
@@ -80,6 +79,12 @@ export function buildReceiptLines(sale: Sale, shopName = effectiveShopName()): s
   for (const p of sale.payments) {
     lines.push(`${p.method.padEnd(12)} ${fmtMoney(p.amount)}`);
   }
+  // Change is ONLY ever real for cash over-tender. A credit split can exceed
+  // the total (borrowing fee onto the tab) and must never print as change —
+  // e.g. CREDIT 160 on a 100 total is a 60 fee, not 60 change handed back.
+  const cashSplit = sale.payments.find((p) => p.method === 'CASH');
+  const change = cashSplit ? Math.max(0, cashSplit.amount - sale.totalAmount) : 0;
+  if (change > 0) lines.push(`CHANGE          ${fmtMoney(change)}`);
   lines.push('--------------------------------');
   lines.push('THANK YOU FOR SHOPPING WITH US!');
   return lines;

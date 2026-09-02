@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore, shopIdOf } from '../stores/authStore';
 import { useUiStore } from '../stores/uiStore';
 import { useCartStore } from '../stores/cartStore';
 import { getCustomers, createCustomer, findByPhone, payCredit, getCreditLedgerDetailed, setAllowCredit } from '../db/repos/customers';
 import type { CreditLedgerRow } from '../db/repos/customers';
+import { isContactPickerSupported, pickPhoneContact, pickVCardContact } from '../lib/contactPicker';
+import type { ContactPick } from '../lib/contactPicker';
 import { Modal, EmptyState } from '../components/ui';
 import { fmtMoney, fmtDateTime, parseMoneyInput } from '../lib/utils';
 import type { Customer } from '../types';
@@ -20,6 +22,12 @@ export default function CustomersPage() {
   const [payAmount, setPayAmount] = useState('');
   const [ledgerFor, setLedgerFor] = useState<Customer | null>(null);
   const [ledger, setLedger] = useState<Array<CreditLedgerRow & { running: number }>>([]);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const phoneRef = useRef<HTMLInputElement>(null);
+  const [contactBusy, setContactBusy] = useState(false);
+  // Android Chrome exposes the native Contacts Picker; everywhere else we fall
+  // back to a vCard import (iOS surfaces a "Contacts" section in its picker).
+  const nativeContacts = isContactPickerSupported();
 
   const load = async () => {
     const rows = await getCustomers(shopIdOf());
@@ -59,6 +67,37 @@ export default function CustomersPage() {
       return;
     }
     await create();
+  };
+
+  /** Apply a successful contact pick / vCard import into the add form. */
+  const applyContactPick = (res: ContactPick) => {
+    setContactBusy(false);
+    if (!res.ok) {
+      if (res.reason === 'unavailable') {
+        toast.push('warn', 'Contact picker is not supported here — type the number or import a vCard instead.');
+      } else if (res.reason === 'failed') {
+        toast.push('error', `Could not open contacts — ${res.message ?? 'unexpected error'}. You can still type the number.`);
+      } else if (res.message) {
+        toast.push('info', res.message);
+      }
+      return;
+    }
+    // Keep any name the user already typed; always take the picked phone.
+    if (nameRef.current && res.name && !nameRef.current.value) nameRef.current.value = res.name;
+    if (phoneRef.current && res.tel) phoneRef.current.value = res.tel;
+    toast.push('success', 'Contact details filled — review and save.');
+  };
+
+  /** Android: native Contacts Picker API. */
+  const pickFromContacts = async () => {
+    setContactBusy(true);
+    applyContactPick(await pickPhoneContact());
+  };
+
+  /** iOS / desktop: import the contact's .vcf through the system picker. */
+  const importVCard = async () => {
+    setContactBusy(true);
+    applyContactPick(await pickVCardContact());
   };
 
   const doPayCredit = async () => {
@@ -210,8 +249,32 @@ export default function CustomersPage() {
       {/* Add modal */}
       <Modal open={addOpen} title="New Customer" onClose={() => setAddOpen(false)}>
         <form onSubmit={(e) => void addCustomer(e)}>
-          <div className="field"><label>Full name</label><input className="input" name="name" required /></div>
-          <div className="field"><label>Phone</label><input className="input" name="phone" placeholder="024X XXX XXXX" required /></div>
+          <div className="field"><label>Full name</label><input className="input" name="name" ref={nameRef} required /></div>
+          <div className="field">
+            <label>Phone</label>
+            <input className="input" name="phone" ref={phoneRef} placeholder="024X XXX XXXX" required />
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              {nativeContacts ? (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-secondary"
+                  onClick={() => void pickFromContacts()}
+                  disabled={contactBusy}
+                >
+                  {contactBusy ? 'Opening…' : '☰ From your contacts'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-secondary"
+                  onClick={() => void importVCard()}
+                  disabled={contactBusy}
+                >
+                  {contactBusy ? 'Opening…' : '📇 Import contact (vCard)'}
+                </button>
+              )}
+            </div>
+          </div>
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
             <button type="button" className="btn btn-secondary" onClick={() => setAddOpen(false)}>Cancel</button>
             <button type="submit" className="btn btn-primary">Add</button>
