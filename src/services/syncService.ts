@@ -9,14 +9,14 @@ import {
   bumpQuota,
   markSaleSynced
 } from '../db/repos/outbox';
-import { isRetryableError } from '../lib/idempotency';
+import { isRetryableError, errorMessage } from '../lib/idempotency';
 import { isSupabaseConfigured } from '../config/env';
 import { useSyncStore } from '../stores/syncStore';
 import { useInventoryStore } from '../stores/inventoryStore';
 import { useAuthStore, shopIdOf, canSeeCosting } from '../stores/authStore';
-import { todayKey } from '../lib/utils';
+import { todayKey, isCloudShopId } from '../lib/utils';
 import { autoBackfillProfit } from '../db/repos/summary';
-import { buildCloudRows, upsertCloudRows, pullCloudChanges, type PulledChange } from './supabaseSync';
+import { buildCloudRows, upsertCloudRows, collapseDuplicates, pullCloudChanges, type PulledChange, type CloudRow } from './supabaseSync';
 
 /**
  * Background sync worker.
@@ -53,6 +53,14 @@ export async function flushOutbox(force = false): Promise<number> {
   useSyncStore.getState().setSyncing(true);
   // Hoisted so the catch can mark exactly the entries we attempted.
   let pending: Awaited<ReturnType<typeof getQueuedOutbox>> = [];
+  // Batch 4: per-attempt attribution. Hoisted so the catch can distinguish
+  // "wrote some rows, then failed" from "failed before writing" and never
+  // mark a row FAILED that actually reached the cloud.
+  let uniqRows: CloudRow[] = [];
+  let mergedEntries: string[] = [];
+  /** True once every uniqRow was accepted by the cloud — a later failure (if
+      any) happened in LOCAL bookkeeping, so no row is a cloud failure. */
+  let upsertDone = false;
   try {
     // force = manual retry also picks up FAILED entries; background ticks only
     // auto-retry PENDING ones so a permanent error stops thrashing the cloud.
@@ -71,17 +79,36 @@ export async function flushOutbox(force = false): Promise<number> {
       return 0;
     }
 
+    // Batch 3: never let ONE statement contain duplicate cloud `id`s. Pre-fix
+    // offline refreshes left duplicate DAILY_SUMMARY/SALE rows in the outbox;
+    // without collapse, a chunk containing both id-s of the same logical row
+    // fails wholesale ("ON CONFLICT DO UPDATE command cannot affect row a
+    // second time") → up to 100 entries all marked FAILED at once. Keep the
+    // newest row per (table, id); remember the superseded outbox entries so
+    // bookkeeping still clears them.
+    const collapsed = collapseDuplicates(rows);
+    uniqRows = collapsed.unique;
+    mergedEntries = collapsed.merged;
+
     // Idempotent upsert keyed on the local id — retries can't double-submit.
-    await upsertCloudRows(rows);
-    await bumpQuota('writes', rows.length);
+    // Returns only the rows the cloud accepted (all on success; on a partial
+    // failure the catch finishes bookkeeping for the accepted slice).
+    const written = await upsertCloudRows(uniqRows);
+    upsertDone = true;
+    await bumpQuota('writes', written.length);
 
     // Post-flush bookkeeping — only the entries we actually wrote.
-    for (const row of rows) {
+    for (const row of written) {
       if (row.entityType === 'SALE') {
         await markSaleSynced(row.id, row.entryId);
       } else {
         await removeOutboxEntry(row.entryId);
       }
+    }
+    // Superseded duplicates were never written — just clear them from the
+    // outbox (their payload was the same logical row, already covered).
+    for (const entryId of mergedEntries) {
+      await removeOutboxEntry(entryId);
     }
 
     // Push must NOT advance the delta watermark. A push says nothing about what
@@ -93,17 +120,63 @@ export async function flushOutbox(force = false): Promise<number> {
     return pending.length;
   } catch (err) {
     // The error is REAL — surface it instead of silently retrying forever.
-    const msg = err instanceof Error ? err.message : String(err);
-    const retryable = isRetryableError(msg);
-    // Only mark the entries we actually attempted, not a fresh fetch.
-    for (const entry of pending) {
-      if (retryable) {
-        // Network-ish blip — keep PENDING so the next tick retries.
-        await markOutboxStatus(entry.id, 'PENDING', msg);
-      } else {
-        // Permanent failure (validation / permissions / type) — stop auto-retry.
-        await markOutboxStatus(entry.id, 'FAILED', msg);
+    // errorMessage(): Supabase throws plain objects (PostgrestError), not
+    // Error instances — `String(err)` destroyed the real reason as
+    // "[object Object]" and isRetryableError() saw garbage. Resolve the true
+    // message first, then classify and persist it.
+    const msg = errorMessage(err);
+    const retryable = isRetryableError(err);
+
+    // Batch 4: attribute per-attempt, never whole-batch. A single failing
+    // chunk must not condemn the unrelated rows. Three distinct cases:
+    //  1. Upsert failed partway -> `err.written` lists the rows the cloud DID
+    //     accept. Finish their bookkeeping (they are synced, not failed) and
+    //     classify ONLY the attempted-but-unwritten remainder.
+    //  2. Failed before any writable row formed (buildCloudRows threw on a
+    //     malformed VOID payload) -> uniqRows is empty. Classify the fetched
+    //     cloud-shop entries by retryability; skip localOnly/demo ones (they
+    //     can never sync — not cloud failures).
+    //  3. Failed AFTER the upsert (a local bookkeeping step threw) -> every
+    //     uniqRow already reached the cloud. Mark NOTHING FAILED leaving them
+    //     PENDING so the next tick re-flushes idempotently and finishes
+    //     cleanup. Marking them FAILED here would be a lie.
+    if (!upsertDone) {
+      const writtenIds = new Set(
+        ((err as { written?: CloudRow[] | undefined }).written ?? []).map((r) => r.entryId)
+      );
+      // Finish bookkeeping for rows that DID land on the cloud.
+      for (const row of uniqRows) {
+        if (writtenIds.has(row.entryId)) {
+          if (row.entityType === 'SALE') {
+            await markSaleSynced(row.id, row.entryId);
+          } else {
+            await removeOutboxEntry(row.entryId);
+          }
+        }
       }
+      const toClassify: Array<{ id: string }> =
+        uniqRows.length === 0
+          ? pending.filter((e) => {
+              const shopId = (e.payload as { shopId?: unknown } | null)?.shopId;
+              return isCloudShopId(typeof shopId === 'string' ? shopId : null);
+            })
+          : uniqRows.filter((r) => !writtenIds.has(r.entryId));
+      for (const entry of toClassify) {
+        if (retryable) {
+          // Network-ish blip — keep PENDING so the next tick retries.
+          await markOutboxStatus(entry.id, 'PENDING', msg);
+        } else {
+          // Permanent failure (validation / permissions / type) — stop auto-retry.
+          await markOutboxStatus(entry.id, 'FAILED', msg);
+        }
+      }
+    }
+    // Superseded (merged) duplicates are cleared even on failure. The kept
+    // (newest) row for the logical id is still in the outbox — never removed
+    // on failure — so the duplicate copy must go, or the next PENDING-only
+    // fetch would push the OLDER snapshot alone and overwrite the newest one.
+    for (const entryId of mergedEntries) {
+      await removeOutboxEntry(entryId);
     }
     useSyncStore.getState().markSyncError(msg);
     await useSyncStore.getState().refresh();
@@ -186,8 +259,10 @@ export async function pullDelta(): Promise<void> {
     // swallowed by the caller's `.catch(() => undefined)`, so a failed pull
     // looked identical to a shop with no data. Recovery stays automatic:
     // we only record the message; the next 15s tick retries the pull and a
-    // successful pull clears the error. (Fix #2.)
-    const msg = err instanceof Error ? err.message : String(err);
+    // successful pull clears the error. (Fix #2.) errorMessage() so a
+    // plain-object (PostgrestError) failure surfaces its real reason instead
+    // of "[object Object]".
+    const msg = errorMessage(err);
     useSyncStore.getState().markSyncError(msg);
     await useSyncStore.getState().refresh();
   } finally {

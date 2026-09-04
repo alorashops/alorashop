@@ -155,9 +155,18 @@ export function buildCloudRows(entries: OutboxEntry[]): CloudRow[] {
   return rows;
 }
 
-/** Upsert cloud rows in per-table batches of 100 (idempotent on `id`). */
-export async function upsertCloudRows(rows: CloudRow[]): Promise<void> {
-  if (rows.length === 0) return;
+/**
+ * Upsert cloud rows in per-table batches of 100 (idempotent on `id`).
+ *
+ * Returns the rows the cloud actually accepted (all of them on success, in
+ * chunk order). If a chunk fails partway, the accepted rows are attached to
+ * the thrown error as `error.written` (a CloudRow[]) so the flush caller can
+ * finish bookkeeping for what landed and attribute the failure to ONLY the
+ * unwritten remainder — instead of condemning the whole batch (Batch 4).
+ */
+export async function upsertCloudRows(rows: CloudRow[]): Promise<CloudRow[]> {
+  const written: CloudRow[] = [];
+  if (rows.length === 0) return written;
   const sb = getClient();
   const grouped = new Map<string, CloudRow[]>();
   for (const r of rows) {
@@ -167,16 +176,63 @@ export async function upsertCloudRows(rows: CloudRow[]): Promise<void> {
   }
   for (const [table, list] of grouped) {
     for (let i = 0; i < list.length; i += 100) {
-      const chunk = list.slice(i, i + 100).map((r) => ({
+      const slice = list.slice(i, i + 100);
+      const chunk = slice.map((r) => ({
         id: r.id,
         shop_id: r.shopId,
         updated_at: r.updatedAt,
         data: r.data
       }));
       const { error } = await sb.from(table).upsert(chunk, { onConflict: 'id' });
-      if (error) throw error;
+      if (error) {
+        // Stash the already-accepted rows on the error so the flush catch can
+        // finish their bookkeeping and only classify the unwritten remainder.
+        (error as { written?: CloudRow[] | undefined }).written = written.slice(0);
+        throw error;
+      }
+      written.push(...slice);
     }
   }
+  return written;
+}
+
+/**
+ * Collapse duplicate cloud `id`s within a flush batch.
+ *
+ * Without this, a single `INSERT … ON CONFLICT (id) DO UPDATE` chunk that
+ * contains two rows for the same table+id fails wholesale with
+ * "ON CONFLICT DO UPDATE command cannot affect row a second time" — Postgres
+ * validates the whole statement, so ONE duplicate pair takes down up to 100
+ * entries (the "multiple sync errors" symptom). Pre-fix offline refreshes
+ * (Batch 2's enqueue-time dedupe) left exactly such duplicates in the outbox,
+ * and every flush re-hit them.
+ *
+ * Resolution: keep the NEWEST row per (table, id) — it is the version this
+ * flush would have written last anyway (later upsert overwrote earlier). The
+ * dropped outbox entries are returned so their callers can still remove them
+ * (their payload was already superseded — removing them is not data loss).
+ *
+ * When `updatedAt` ties, the FIRST entry wins (the GETQueued order is oldest
+ * first, so the earliest-queued row is the canonical one).
+ */
+export function collapseDuplicates(rows: CloudRow[]): { unique: CloudRow[]; merged: string[] } {
+  const byKey = new Map<string, CloudRow>();
+  const merged: string[] = [];
+  for (const row of rows) {
+    const key = `${row.table}\u0000${row.id}`;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, row);
+      continue;
+    }
+    if (row.updatedAt > existing.updatedAt) {
+      byKey.set(key, row); // newer supersedes — drop the older entry's outbox row
+      merged.push(existing.entryId);
+    } else {
+      merged.push(row.entryId); // older/newer-equal superseded by the kept row
+    }
+  }
+  return { unique: [...byKey.values()], merged };
 }
 
 /** Pull page size — well under Supabase's 1,000-row cap so each response stays

@@ -149,6 +149,26 @@ export async function markSaleSynced(saleId: string, outboxId: string): Promise<
  */
 export async function enqueueDailySummary(summary: DailySummary): Promise<void> {
   if (!summary || !isCloudShopId(summary.shopId)) return;
+  // Replace any still-queued DAILY_SUMMARY entry for this (shop, date) —
+  // the outbox must never hold two rows whose payloads map to the same cloud
+  // `id`. enqueueSale already dedupes; this one did NOT, so every offline
+  // Analytics Refresh (autoBackfillProfit → enqueueDailySummary) appended yet
+  // another PENDING row with the same summary.id — and a single flush batch
+  // could then contain both `id`s in one upsert chunk, which Postgres rejects
+  // wholesale ("ON CONFLICT DO UPDATE command cannot affect row a second
+  // time") → the whole batch failed → "multiple sync errors". A fresh summary
+  // supersedes any still-queued copy for the day.
+  const pending = await db.outbox
+    .where('status')
+    .equals('PENDING')
+    .and((e) => e.entityType === 'DAILY_SUMMARY')
+    .toArray();
+  for (const e of pending) {
+    const p = (e.payload ?? {}) as { id?: unknown };
+    if (p.id === summary.id) {
+      await db.outbox.delete(e.id);
+    }
+  }
   await db.outbox.add({
     id: uid(),
     idempotencyKey: `daily_summary_${summary.id}`,
