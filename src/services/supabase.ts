@@ -144,16 +144,20 @@ export async function signIn(email: string, password: string): Promise<void> {
   if (error) throw error;
 }
 
-/** Returns true when email confirmation is still required (session not yet active). */
-export async function signUp(email: string, password: string, displayName: string): Promise<boolean> {
+/**
+ * Creates a new (shop owner) account. No email confirmation is required —
+ * with "Confirm email" OFF in the Supabase dashboard the account is active
+ * immediately and `login()` right after establishes the session. No link, no
+ * expiry, nothing to wait for.
+ */
+export async function signUp(email: string, password: string, displayName: string): Promise<void> {
   const sb = await getSupabase();
-  const { data, error } = await sb.auth.signUp({
+  const { error } = await sb.auth.signUp({
     email,
     password,
     options: { data: { display_name: displayName } }
   });
   if (error) throw error;
-  return !data.session; // falsy session => a verification email was dispatched
 }
 
 export async function signOut(): Promise<void> {
@@ -172,50 +176,38 @@ export async function createShop(shopName: string, phone?: string): Promise<stri
 /**
  * Adds a staff member via the SECURITY DEFINER RPC. Role guardrails run
  * server-side: admin may add manager/cashier, manager may add cashier only.
- * Returns the new user's id.
  *
- * IMPORTANT: this only CREATES the account (email-unconfirmed, unusable
- * password). The caller must then call `sendStaffInvite()` so the new hire
- * receives an email with a recovery link to set their own password.
+ * The admin supplies an initial (temporary) password. The server creates a
+  * CONFIRMED user with that password directly — there is NO expiring invite
+  * link to wait on, so the new hire can sign in immediately.
+  *
+  * Returns the new user's id.
  */
-export async function addStaff(email: string, displayName: string, role: Role): Promise<string> {
+export async function addStaff(email: string, displayName: string, role: Role, password: string): Promise<string> {
   const sb = await getSupabase();
   const { data, error } = await sb.rpc('add_staff', {
     staff_email: email.trim(),
     staff_name: displayName.trim(),
-    staff_role: role
+    staff_role: role,
+    staff_password: password
   });
   if (error) throw error;
   return data as string;
 }
 
 /**
- * Emails the staff member a password-recovery link (GoTrue's default recovery
- * template) — the invite mechanism. Clicking it purports to set a password; we
- * guide them to it, which both verifies their email and completes the signup.
- * Uses the public anon-key endpoint, so no service-role secret is required.
- * `#/reset` matches the HashRouter route for the invite landing screen.
+ * Resets a staff member's password WITHOUT email — the admin (SECURITY DEFINER
+ * `reset_staff_password` RPC) supplies a new temporary password directly. This
+ * is the app's only password-recovery path: no links, no expiry, nothing to
+ * wait for. The admin shares the new password with the staff member in person.
  */
-export async function sendStaffInvite(email: string): Promise<void> {
+export async function resetStaffPassword(uid: string, newPassword: string): Promise<void> {
   const sb = await getSupabase();
-  const { error } = await sb.auth.resetPasswordForEmail(email.trim(), {
-    redirectTo: `${window.location.origin}${window.location.pathname}#/reset`
+  const { error } = await sb.rpc('reset_staff_password', {
+    target_user_id: uid,
+    new_password: newPassword
   });
   if (error) throw error;
-}
-
-/** Sets a new password for the currently-authenticated (recovery) session. */
-export async function updatePassword(newPassword: string): Promise<void> {
-  const sb = await getSupabase();
-  const { error } = await sb.auth.updateUser({ password: newPassword });
-  if (error) throw error;
-}
-
-/** True when an active session exists (a recovery link / invite has been opened). */
-export async function hasActiveSession(): Promise<boolean> {
-  const sb = await getSupabase();
-  const { data } = await sb.auth.getSession();
-  return Boolean(data.session);
 }
 
 /**

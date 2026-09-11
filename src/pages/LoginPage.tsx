@@ -56,126 +56,36 @@ function AuthShell() {
   const [displayName, setDisplayName] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [info, setInfo] = useState('');
-  /** True after a signup that needs email confirmation — swaps the form for a
-      "check your email" panel with a one-tap link to the inbox. */
-  const [pendingConfirmation, setPendingConfirmation] = useState(false);
+    const [error, setError] = useState('');
 
-  const confirmFromEmail = async () => {
-    setError('');
-    setInfo('');
-    setBusy(true);
-    try {
-      const login = useAuthStore.getState().login;
-      await login(email.trim(), password);
-      navigate('/pos', { replace: true });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong.');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    setInfo('');
-    setBusy(true);
-    try {
-      if (mode === 'login') {
-        const login = useAuthStore.getState().login;
-        await login(email.trim(), password);
-        navigate('/pos', { replace: true });
-      } else {
-        const signUp = useAuthStore.getState().signUp;
-        const { requiresConfirmation } = await signUp(email.trim(), password, displayName.trim() || email.trim());
-        if (requiresConfirmation) {
-          setPendingConfirmation(true);
-          setInfo('Almost there — we sent a verification email. Tap the link in it to confirm your address.');
+    const submit = async (e: React.FormEvent) => {
+      e.preventDefault();
+      setError('');
+      setBusy(true);
+      try {
+        const auth = useAuthStore.getState();
+        if (mode === 'login') {
+          await auth.login(email.trim(), password);
         } else {
-          navigate('/pos', { replace: true });
+          // Sign up creates the account AND signs in immediately — no email
+          // verification, no link, no expiry.
+          await auth.signUp(email.trim(), password, displayName.trim() || email.trim());
         }
+        navigate('/pos', { replace: true });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Something went wrong.';
+        // Only realistic setup hiccup: "Confirm email" still ON in Supabase.
+        setError(
+          msg.toLowerCase().includes('email not confirmed')
+            ? 'Account created, but email confirmation is still enabled in Supabase. Turn it OFF under Authentication → Sign In / Up → Email, then try again.'
+            : msg
+        );
+      } finally {
+        setBusy(false);
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong.');
-    } finally {
-      setBusy(false);
-    }
-  };
+    };
 
   const field = (value: string, set: (v: string) => void) => ({ value, onChange: (e: React.ChangeEvent<HTMLInputElement>) => set(e.target.value) });
-
-  // Which inbox the signup email is on — only Gmail / iCloud get a one-tap
-  // button (per requirement); every other provider shows a plain hint.
-  const emailDomain = email.trim().split('@')[1]?.toLowerCase() ?? '';
-  const provider =
-    emailDomain === 'gmail.com' ? 'gmail' : emailDomain === 'icloud.com' ? 'icloud' : 'other';
-
-  if (pendingConfirmation) {
-    return (
-      <Box>
-        <Brand />
-        <p className="sub">Offline-first — your local database is your data.</p>
-        <div style={{ padding: '8px 2px' }}>
-          <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--primary, #6366f1)' }}>
-            📩 Check your email
-          </div>
-          <p style={{ margin: '10px 0 4px', fontSize: 14 }}>
-            We sent a confirmation link to <strong>{email.trim()}</strong>. Open the email and tap{' '}
-            <strong>Confirm your email</strong> to verify your address.
-          </p>
-
-          {provider === 'gmail' && (
-            <button
-              type="button"
-              className="btn btn-block"
-              style={{ marginTop: 12, padding: '12px 0', fontWeight: 800 }}
-              onClick={() => window.open('https://mail.google.com/', '_blank')}
-            >
-              Open Gmail ↗
-            </button>
-          )}
-          {provider === 'icloud' && (
-            <button
-              type="button"
-              className="btn btn-block"
-              style={{ marginTop: 12, padding: '12px 0', fontWeight: 800 }}
-              onClick={() => window.open('https://www.icloud.com/mail', '_blank')}
-            >
-              Open iCloud Mail ↗
-            </button>
-          )}
-          {provider === 'other' && (
-            <p style={{ fontSize: 13, color: 'var(--text-muted, #64748b)', marginTop: 12 }}>
-              Open your email app to find the confirmation link.
-            </p>
-          )}
-
-          <button
-            type="button"
-            className="btn btn-block"
-            style={{ marginTop: 10, background: 'var(--success, #16a34a)', color: '#fff', fontWeight: 800 }}
-            onClick={() => void confirmFromEmail()}
-            disabled={busy}
-          >
-            {busy ? 'Checking…' : "I've confirmed — Log in"}
-          </button>
-
-          {error && <div style={{ color: '#dc2626', fontSize: 13, marginTop: 8 }}>{error}</div>}
-
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm"
-            style={{ marginTop: 12 }}
-            onClick={() => { setPendingConfirmation(false); setMode('signup'); setError(''); setInfo(''); }}
-          >
-            ← Use a different email / start over
-          </button>
-        </div>
-      </Box>
-    );
-  }
 
   return (
     <Box>
@@ -187,7 +97,7 @@ function AuthShell() {
           <button
             key={m}
             type="button"
-            onClick={() => { setMode(m); setError(''); setInfo(''); }}
+            onClick={() => { setMode(m); setError(''); }}
             style={{
               flex: 1,
               padding: '8px 0',
@@ -246,14 +156,13 @@ function AuthShell() {
               }}
             >
               {showPassword ? '🙈' : '👁️'}
-            </button>
-          </div>
-        </div>
+                          </button>
+                        </div>
+                      </div>
 
-        {error && <div style={{ color: '#dc2626', fontSize: 13 }}>{error}</div>}
-        {info && <div style={{ color: '#16a34a', fontSize: 13 }}>{info}</div>}
+                      {error && <div style={{ color: '#dc2626', fontSize: 13 }}>{error}</div>}
 
-        <button className="btn" type="submit" disabled={busy} style={{ padding: '12px 0', fontWeight: 800 }}>
+                      <button className="btn" type="submit" disabled={busy} style={{ padding: '12px 0', fontWeight: 800 }}>
           {busy ? 'Please wait…' : mode === 'login' ? 'Log in' : 'Create account'}
         </button>
       </form>

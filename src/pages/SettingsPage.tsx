@@ -7,7 +7,7 @@ import { db } from '../db';
 import { clearLocalData } from '../services/seedService';
 import { flushOutbox } from '../services/syncService';
 import { purgeLocalOnlyOutbox } from '../db/repos/outbox';
-import { addStaff, sendStaffInvite } from '../services/supabase';
+import { addStaff, resetStaffPassword } from '../services/supabase';
 import { Modal } from '../components/ui';
 import { isSupabaseConfigured } from '../config/env';
 import { useInstallPrompt } from '../hooks/useInstallPrompt';
@@ -38,12 +38,17 @@ export default function SettingsPage() {
   const isAdmin = canAddManager(user?.role);
   const [staff, setStaff] = useState<UserProfile[]>([]);
   const [exporting, setExporting] = useState(false);
-  // Add-staff modal
-  const [staffModalOpen, setStaffModalOpen] = useState(false);
+    // Add-staff modal
+    const [staffModalOpen, setStaffModalOpen] = useState(false);
   const [staffEmail, setStaffEmail] = useState('');
   const [staffName, setStaffName] = useState('');
   const [staffRole, setStaffRole] = useState<Role>('cashier');
+  const [staffPassword, setStaffPassword] = useState('');
   const [addingStaff, setAddingStaff] = useState(false);
+  // Reset-password modal (admin only) — no email, admin picks a new password.
+  const [resetFor, setResetFor] = useState<UserProfile | null>(null);
+  const [resetPassword, setResetPassword] = useState('');
+  const [resetting, setResetting] = useState(false);
   const { state: installState, promptInstall } = useInstallPrompt();
 
   // Shop name — admin can edit; everyone sees it on the sidebar + receipts.
@@ -164,38 +169,66 @@ export default function SettingsPage() {
     );
   };
 
-  /**
-   * Creates the staff account on the cloud (SECURITY DEFINER add_staff RPC),
-   * sends them an invite email to set their OWN password, then mirrors the new
-   * profile row locally so the list updates immediately. Role guardrails run
-   * on the server — this UI only offers valid options.
+    /**
+     * Creates the staff account on the cloud (SECURITY DEFINER add_staff RPC)
+   * with a temporary password set by the admin — NO invite email, no link, no
+   * expiry. The new hire can sign in immediately with their email + this
+   * password. The profile is mirrored locally so the list updates right away.
+   * Role guardrails run on the server — this UI only offers valid options.
    */
   const handleAddStaff = async () => {
     if (!isSupabaseConfigured) {
-      toast.push('error', 'Cloud not configured — staff invites need a connected Supabase project (.env).');
+      toast.push('error', 'Cloud not configured — staff accounts need a connected Supabase project (.env).');
       return;
     }
     if (!staffEmail.trim() || !staffName.trim()) {
       toast.push('warn', 'Please fill in the name and email.');
       return;
     }
+    if (staffPassword.length < 6) {
+      toast.push('warn', 'Temporary password must be at least 6 characters.');
+      return;
+    }
     setAddingStaff(true);
     try {
-      // Creates the account (unconfirmed, no usable password).
-      const uid = await addStaff(staffEmail, staffName, staffRole);
-      // Sends the invite email with a recovery link → staff set their own password.
-      await sendStaffInvite(staffEmail);
+      // Creates a confirmed account with the admin-chosen password.
+      const uid = await addStaff(staffEmail, staffName, staffRole, staffPassword);
       await db.users.put({ uid, shopId: user?.shopId ?? '', displayName: staffName.trim(), role: staffRole });
-      toast.push('success', `Invite sent — ${staffName.trim()} will set their own password.`);
+      toast.push('success', `${staffName.trim()} can now sign in with the password you set.`);
       setStaffModalOpen(false);
       setStaffEmail('');
       setStaffName('');
       setStaffRole('cashier');
+      setStaffPassword('');
       loadStaff();
     } catch (err) {
       toast.push('error', err instanceof Error ? err.message : String(err));
     } finally {
       setAddingStaff(false);
+    }
+  };
+
+  /**
+   * Admin-only password reset — no email involved. The admin picks a new
+   * temporary password for a staff member (SECURITY DEFINER RPC) and shares it
+   * in person. This is the app's only password-recovery path.
+   */
+  const handleResetStaffPassword = async () => {
+    if (!resetFor) return;
+    if (resetPassword.length < 6) {
+      toast.push('warn', 'New password must be at least 6 characters.');
+      return;
+    }
+    setResetting(true);
+    try {
+      await resetStaffPassword(resetFor.uid, resetPassword);
+      toast.push('success', `Password reset for ${resetFor.displayName}. Share the new password with them.`);
+      setResetFor(null);
+      setResetPassword('');
+    } catch (err) {
+      toast.push('error', err instanceof Error ? err.message : String(err));
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -331,22 +364,34 @@ export default function SettingsPage() {
               + Add staff
             </button>
           </div>
-          <table className="table">
-            <thead><tr><th>Name</th><th>Role</th><th>Shop</th></tr></thead>
+                    <table className="table">
+                      <thead><tr><th>Name</th><th>Role</th><th>Shop</th>{isAdmin && <th></th>}</tr></thead>
             <tbody>
               {staff.map((s) => (
                 <tr key={s.uid}>
                   <td style={{ fontWeight: 700 }}>{s.displayName}</td>
                   <td><span className={`tag ${s.role === 'admin' ? 'indigo' : s.role === 'manager' ? 'amber' : 'slate'}`}>{s.role}</span></td>
                   <td className="mono">{s.shopId}</td>
+                  {isAdmin && (
+                    <td style={{ textAlign: 'right' }}>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        disabled={s.uid === user?.uid}
+                        title={s.uid === user?.uid ? 'You manage your own account from the login screen' : 'Set a new temporary password (no email)'}
+                        onClick={() => { setResetFor(s); setResetPassword(''); }}
+                      >
+                        Reset password
+                      </button>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
           </table>
           <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
             {isAdmin
-              ? 'Admins can add managers and cashiers. Roles enforce via Supabase RLS + auth claims, never the client.'
-              : 'Managers can add cashiers. Adding another manager requires an admin.'}
+              ? 'Admins can add managers and cashiers, and reset any staff password — no email needed, just share the new password in person. Roles enforce via Supabase RLS + auth claims, never the client.'
+              : 'Managers can add cashiers. Adding another manager or resetting passwords requires an admin.'}
           </p>
         </div>
       )}
@@ -358,13 +403,25 @@ export default function SettingsPage() {
             <label>Full name</label>
             <input className="input" value={staffName} onChange={(e) => setStaffName(e.target.value)} placeholder="e.g. Kofi Mensah" autoFocus />
           </div>
-          <div className="field">
-            <label>Email (must be unique — they'll log in with this)</label>
+                    <div className="field">
+                      <label>Email (must be unique — they'll log in with this)</label>
             <input className="input" type="email" value={staffEmail} onChange={(e) => setStaffEmail(e.target.value)} placeholder="you@example.com" />
           </div>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            An invite email will be sent to this address with a secure link to set their own password. No password is shared through this device.
-          </p>
+          <div className="field">
+            <label>Temporary password</label>
+            <input
+              className="input"
+              type="text"
+              value={staffPassword}
+              onChange={(e) => setStaffPassword(e.target.value)}
+              placeholder="At least 6 characters"
+              minLength={6}
+              required
+            />
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              No email is sent. Share this password with them in person — they sign in right away with it.
+            </span>
+          </div>
           {isAdmin && (
             <div className="field">
               <label>Role</label>
@@ -383,6 +440,33 @@ export default function SettingsPage() {
             <button className="btn btn-secondary" onClick={() => setStaffModalOpen(false)}>Cancel</button>
             <button className="btn btn-primary" onClick={() => void handleAddStaff()} disabled={addingStaff}>
               {addingStaff ? 'Adding…' : 'Add staff'}
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Reset password modal (admin only) — no email, admin sets a new password */}
+      <Modal open={resetFor !== null} title={`Reset password — ${resetFor?.displayName ?? ''}`} onClose={() => { setResetFor(null); setResetPassword(''); }}>
+        <div style={{ display: 'grid', gap: 12 }}>
+          <div className="field">
+            <label>New temporary password</label>
+            <input
+              className="input"
+              type="text"
+              value={resetPassword}
+              onChange={(e) => setResetPassword(e.target.value)}
+              placeholder="At least 6 characters"
+              minLength={6}
+              autoFocus
+            />
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              No email is sent. Share the new password with them in person.
+            </span>
+          </div>
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+            <button className="btn btn-secondary" onClick={() => { setResetFor(null); setResetPassword(''); }}>Cancel</button>
+            <button className="btn btn-primary" onClick={() => void handleResetStaffPassword()} disabled={resetting}>
+              {resetting ? 'Resetting…' : 'Reset password'}
             </button>
           </div>
         </div>

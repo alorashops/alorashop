@@ -12,7 +12,6 @@ import { Toasts, ConfirmDialog } from './components/overlays';
 import { ReceiptModal } from './components/ReceiptModal';
 import { InstallPromptPopup } from './components/InstallPromptPopup';
 import LoginPage from './pages/LoginPage';
-import ResetPasswordPage from './pages/ResetPasswordPage';
 import POSPage from './pages/POSPage';
 import InventoryPage from './pages/InventoryPage';
 import SalesPage from './pages/SalesPage';
@@ -192,10 +191,9 @@ export default function App() {
   return (
     <HashRouter>
       <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/reset" element={<ResetPasswordPage />} />
-        <Route path="/*" element={<Shell />} />
-      </Routes>
+              <Route path="/login" element={<LoginPage />} />
+              <Route path="/*" element={<Shell />} />
+            </Routes>
       <Toasts />
       <ConfirmDialog />
       <ReceiptModal />

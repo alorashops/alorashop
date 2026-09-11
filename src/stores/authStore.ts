@@ -19,8 +19,8 @@ interface AuthState {
   /** True once the session has been restored on boot (offline-safe). */
   booted: boolean;
   initialize: () => Promise<void>;
-  login: (email: string, password: string) => Promise<void>;
-  signUp: (email: string, password: string, displayName: string) => Promise<{ requiresConfirmation: boolean }>;
+    login: (email: string, password: string) => Promise<void>;
+    signUp: (email: string, password: string, displayName: string) => Promise<void>;
   createShop: (name: string, phone?: string) => Promise<void>;
   logout: () => Promise<void>;
   switchShop: (shopId: string) => void;
@@ -192,11 +192,19 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
     const next = resolveIdentity(s, profile, get().user);
     set({ user: next });
     writeCachedIdentity(next);
-  },
+      },
 
-  signUp: async (email, password, displayName) => {
-    const requiresConfirmation = await signUp(email, password, displayName);
-    return { requiresConfirmation };
+      signUp: async (email, password, displayName) => {
+    // Create the account (no email confirmation — instantly active), then sign
+    // in right away so the session is established without any link/expiry.
+    await signUp(email, password, displayName);
+    await signIn(email, password);
+    const s = await getLocalUser();
+    if (!s) return;
+    const profile = await tryFetchProfile(s.id);
+    const next = resolveIdentity(s, profile, get().user);
+    set({ user: next });
+    writeCachedIdentity(next);
   },
 
   createShop: async (name: string, phone?: string) => {
