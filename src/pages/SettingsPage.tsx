@@ -25,6 +25,24 @@ const ROLE_MATRIX: Array<[string, string, boolean, boolean, boolean]> = [
   ['Shop settings, pricing, data export', 'Settings', false, false, true]
 ];
 
+/**
+ * Best-effort human-readable message from any thrown value. Supabase returns
+ * PostgrestError objects — plain objects with a `.message` field, NOT Error
+ * instances — so `err instanceof Error` misses them and `String(err)` yields
+ * the useless "[object Object]".
+ */
+function errMsg(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === 'object') {
+    const e = err as Record<string, unknown>;
+    const parts: string[] = [];
+    if (typeof e.message === 'string' && e.message.trim()) parts.push(e.message);
+    if (typeof e.hint === 'string' && e.hint.trim()) parts.push(`(${e.hint})`);
+    if (parts.length) return parts.join(' ');
+  }
+  return String(err);
+}
+
 export default function SettingsPage() {
   const user = useAuthStore((s) => s.user);
   const toast = useUiStore();
@@ -79,7 +97,7 @@ export default function SettingsPage() {
       const synced = await updateShopName(trimmed);
       toast.push(synced ? 'success' : 'info', synced ? 'Shop name updated.' : 'Saved on this device — the cloud will confirm when it reconnects.');
     } catch (err) {
-      toast.push('error', err instanceof Error ? err.message : String(err));
+      toast.push('error', errMsg(err));
     } finally {
       setSavingName(false);
     }
@@ -114,7 +132,7 @@ export default function SettingsPage() {
       URL.revokeObjectURL(url);
       toast.push('success', 'Local data exported (JSON)');
     } catch (err) {
-      toast.push('error', err instanceof Error ? err.message : String(err));
+      toast.push('error', errMsg(err));
     } finally {
       setExporting(false);
     }
@@ -133,7 +151,7 @@ export default function SettingsPage() {
         toast.push('success', 'Outbox flushed — everything synced.');
       }
     } catch (err) {
-      toast.push('error', err instanceof Error ? err.message : String(err));
+      toast.push('error', errMsg(err));
     }
   };
 
@@ -147,7 +165,7 @@ export default function SettingsPage() {
           await refreshSync();
           toast.push('success', `Removed ${n} local-only outbox ${n === 1 ? 'entry' : 'entries'}.`);
         } catch (err) {
-          toast.push('error', err instanceof Error ? err.message : String(err));
+          toast.push('error', errMsg(err));
         }
       }
     );
@@ -163,7 +181,7 @@ export default function SettingsPage() {
           toast.push('success', 'Local data cleared — reload to re-seed.');
           setTimeout(() => window.location.reload(), 800);
         } catch (err) {
-          toast.push('error', err instanceof Error ? err.message : String(err));
+          toast.push('error', errMsg(err));
         }
       }
     );
@@ -202,7 +220,7 @@ export default function SettingsPage() {
       setStaffPassword('');
       loadStaff();
     } catch (err) {
-      toast.push('error', err instanceof Error ? err.message : String(err));
+      toast.push('error', errMsg(err));
     } finally {
       setAddingStaff(false);
     }
@@ -226,7 +244,7 @@ export default function SettingsPage() {
       setResetFor(null);
       setResetPassword('');
     } catch (err) {
-      toast.push('error', err instanceof Error ? err.message : String(err));
+      toast.push('error', errMsg(err));
     } finally {
       setResetting(false);
     }
