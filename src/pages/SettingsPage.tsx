@@ -63,9 +63,12 @@ export default function SettingsPage() {
   const [staffRole, setStaffRole] = useState<Role>('cashier');
   const [staffPassword, setStaffPassword] = useState('');
   const [addingStaff, setAddingStaff] = useState(false);
+  // P10b: the caller re-enters their OWN password to authorize the action.
+  const [staffActorPassword, setStaffActorPassword] = useState('');
   // Reset-password modal (admin only) — no email, admin picks a new password.
   const [resetFor, setResetFor] = useState<UserProfile | null>(null);
   const [resetPassword, setResetPassword] = useState('');
+  const [resetActorPassword, setResetActorPassword] = useState('');
   const [resetting, setResetting] = useState(false);
   const { state: installState, promptInstall } = useInstallPrompt();
 
@@ -207,10 +210,15 @@ export default function SettingsPage() {
       toast.push('warn', 'Temporary password must be at least 6 characters.');
       return;
     }
+    if (!staffActorPassword) {
+      toast.push('warn', 'Enter your own password to confirm this action.');
+      return;
+    }
     setAddingStaff(true);
     try {
-      // Creates a confirmed account with the admin-chosen password.
-      const uid = await addStaff(staffEmail, staffName, staffRole, staffPassword);
+      // Creates a confirmed account with the admin-chosen password. The server
+      // re-verifies staffActorPassword (the caller's own) before doing anything.
+      const uid = await addStaff(staffEmail, staffName, staffRole, staffPassword, staffActorPassword);
       await db.users.put({ uid, shopId: user?.shopId ?? '', displayName: staffName.trim(), role: staffRole });
       toast.push('success', `${staffName.trim()} can now sign in with the password you set.`);
       setStaffModalOpen(false);
@@ -218,6 +226,7 @@ export default function SettingsPage() {
       setStaffName('');
       setStaffRole('cashier');
       setStaffPassword('');
+      setStaffActorPassword('');
       loadStaff();
     } catch (err) {
       toast.push('error', errMsg(err));
@@ -237,12 +246,17 @@ export default function SettingsPage() {
       toast.push('warn', 'New password must be at least 6 characters.');
       return;
     }
+    if (!resetActorPassword) {
+      toast.push('warn', 'Enter your own password to confirm this action.');
+      return;
+    }
     setResetting(true);
     try {
-      await resetStaffPassword(resetFor.uid, resetPassword);
+      await resetStaffPassword(resetFor.uid, resetPassword, resetActorPassword);
       toast.push('success', `Password reset for ${resetFor.displayName}. Share the new password with them.`);
       setResetFor(null);
       setResetPassword('');
+      setResetActorPassword('');
     } catch (err) {
       toast.push('error', errMsg(err));
     } finally {
@@ -415,7 +429,7 @@ export default function SettingsPage() {
       )}
 
       {/* Add staff modal */}
-      <Modal open={staffModalOpen} title="Add staff member" onClose={() => setStaffModalOpen(false)}>
+      <Modal open={staffModalOpen} title="Add staff member" onClose={() => { setStaffModalOpen(false); setStaffActorPassword(''); }}>
         <div style={{ display: 'grid', gap: 12 }}>
           <div className="field">
             <label>Full name</label>
@@ -440,6 +454,20 @@ export default function SettingsPage() {
               No email is sent. Share this password with them in person — they sign in right away with it.
             </span>
           </div>
+          <div className="field">
+            <label>Your password (to confirm)</label>
+            <input
+              className="input"
+              type="password"
+              value={staffActorPassword}
+              onChange={(e) => setStaffActorPassword(e.target.value)}
+              placeholder="Your own current password"
+              autoComplete="current-password"
+            />
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              Required: confirms it is really you adding this account. Never stored.
+            </span>
+          </div>
           {isAdmin && (
             <div className="field">
               <label>Role</label>
@@ -455,7 +483,7 @@ export default function SettingsPage() {
             </p>
           )}
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-            <button className="btn btn-secondary" onClick={() => setStaffModalOpen(false)}>Cancel</button>
+            <button className="btn btn-secondary" onClick={() => { setStaffModalOpen(false); setStaffActorPassword(''); }}>Cancel</button>
             <button className="btn btn-primary" onClick={() => void handleAddStaff()} disabled={addingStaff}>
               {addingStaff ? 'Adding…' : 'Add staff'}
             </button>
@@ -464,7 +492,7 @@ export default function SettingsPage() {
       </Modal>
 
       {/* Reset password modal (admin only) — no email, admin sets a new password */}
-      <Modal open={resetFor !== null} title={`Reset password — ${resetFor?.displayName ?? ''}`} onClose={() => { setResetFor(null); setResetPassword(''); }}>
+      <Modal open={resetFor !== null} title={`Reset password — ${resetFor?.displayName ?? ''}`} onClose={() => { setResetFor(null); setResetPassword(''); setResetActorPassword(''); }}>
         <div style={{ display: 'grid', gap: 12 }}>
           <div className="field">
             <label>New temporary password</label>
@@ -481,8 +509,22 @@ export default function SettingsPage() {
               No email is sent. Share the new password with them in person.
             </span>
           </div>
+          <div className="field">
+            <label>Your password (to confirm)</label>
+            <input
+              className="input"
+              type="password"
+              value={resetActorPassword}
+              onChange={(e) => setResetActorPassword(e.target.value)}
+              placeholder="Your own current password"
+              autoComplete="current-password"
+            />
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              Required: confirms it is really you resetting this password. Never stored.
+            </span>
+          </div>
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-            <button className="btn btn-secondary" onClick={() => { setResetFor(null); setResetPassword(''); }}>Cancel</button>
+            <button className="btn btn-secondary" onClick={() => { setResetFor(null); setResetPassword(''); setResetActorPassword(''); }}>Cancel</button>
             <button className="btn btn-primary" onClick={() => void handleResetStaffPassword()} disabled={resetting}>
               {resetting ? 'Resetting…' : 'Reset password'}
             </button>

@@ -2,6 +2,7 @@ import type { Sale } from '../types';
 import { fmtMoney, fmtDateTime } from '../lib/utils';
 import { DEFAULT_SHOP_NAME } from '../config/env';
 import { shopNameOf } from '../stores/shopStore';
+import { renderReceiptDocument } from './receiptDom';
 
 /**
  * Receipt printing.
@@ -90,22 +91,25 @@ export function buildReceiptLines(sale: Sale, shopName = effectiveShopName()): s
   return lines;
 }
 
+/**
+ * CSS print window (fallback printer path).
+ *
+ * P7 (SECURITY_PLAN.md) — stored XSS. The old implementation built the receipt
+ * HTML with `document.write` + string interpolation, embedding UNESCAPED
+ * user-controlled shop/product/cashier names straight into markup, so
+ * `<img src=x onerror=…>` or `<script>…</script>` executed in the SAME-ORIGIN
+ * print window -> session + DB theft. The document is now built exclusively
+ * with createElement + textContent (see receiptDom.ts), so no user-controlled
+ * string ever reaches an HTML parser.
+ *
+ * The print-window lifecycle (open -> replaceChildren -> close) lives in
+ * renderReceiptDocument — read the warning there before "tidying" it; removing
+ * it blanks the window.
+ */
 export function printCss(sale: Sale, shopName = effectiveShopName()): boolean {
   const w = window.open('', '_blank', 'width=380,height=640');
   if (!w) return false;
-  const body = buildReceiptLines(sale, shopName)
-    .map((l) => `<div>${l.replace(/ /g, '&nbsp;')}</div>`)
-    .join('');
-  w.document.write(`<!doctype html><html><head><title>Receipt</title><style>
-    @page { size: 80mm auto; margin: 2mm; }
-    body { font-family: 'Courier New', monospace; font-size: 12px; white-space: pre; }
-    .no-print { display: block; margin-bottom: 8px; }
-    @media print { .no-print { display: none; } }
-  </style></head><body>
-    <button class="no-print" onclick="window.print()">Print Receipt</button>
-    ${body}
-  </body></html>`);
-  w.document.close();
+  renderReceiptDocument(w.document, buildReceiptLines(sale, shopName), () => w.print());
   return true;
 }
 

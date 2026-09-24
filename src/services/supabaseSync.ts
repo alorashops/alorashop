@@ -5,14 +5,15 @@ import type { OutboxEntry } from '../types';
 /**
  * Supabase data mirror — the cloud side of the offline-first outbox.
  *
- * Design (matches the Supabase migration `0002_domain_tables.sql`):
+ * Design (the domain tables are UNVERSIONED — they exist only in the live DB,
+ * there is no `0002_domain_tables.sql` in this repo):
  *  - One row per local document, keyed by the SAME `id` the device generates.
  *    Upserting on `id` conflict is therefore naturally idempotent — retries
  *    can never double-submit, no separate idempotency table needed.
  *  - `shop_id` is the owning shop's uuid; RLS makes sure a client can only
  *    ever touch its own shop's rows (current_shop_id()).
  *  - `updated_at` is epoch ms, so the delta pull compares against the same
- *    JS cursor the device already uses (fixes the old Firestore mismatch).
+ *    JS cursor the device already uses (the epoch-ms cursor both sides share).
  *  - The cloud is an append-only mirror: no delete grants in the migration.
  */
 
@@ -95,12 +96,15 @@ const ENTITY_MAP: Record<CloudEntity, { table: string; data: (p: any) => Record<
   }
 };
 
-const PULL_TABLES: Array<{ table: string; entity: CloudEntity }> = [
+const PULL_TABLES: Array<{ table: string; via?: string; entity: CloudEntity }> = [
   { table: 'products', entity: 'PRODUCT' },
   { table: 'product_costing', entity: 'PRODUCT_COSTING' },
-  { table: 'sales', entity: 'SALE' },
+  // P6d: read through the server-side masking views so the cloud never hands a
+  // cashier the margin fields (profit / items[].costPriceAtSale / totalProfit).
+  // Writes still upsert to the raw `sales`/`daily_summaries` tables.
+  { table: 'sales', via: 'sales_secure', entity: 'SALE' },
   { table: 'stock_ledger', entity: 'RESTOCK' },
-  { table: 'daily_summaries', entity: 'DAILY_SUMMARY' },
+  { table: 'daily_summaries', via: 'daily_summaries_secure', entity: 'DAILY_SUMMARY' },
   { table: 'customers', entity: 'CUSTOMER' },
   { table: 'credit_ledger', entity: 'CREDIT_LEDGER' }
 ];
@@ -260,11 +264,14 @@ export async function pullCloudChanges(cursor: number): Promise<PulledChange[]> 
   const changes: PulledChange[] = [];
   for (const t of PULL_TABLES) {
     let from = 0;
+    // P6d: SALE/DAILY_SUMMARY read through the masking view (t.via); the rest
+    // read their own table. Writes are unaffected (they use `table`, not `via`).
+    const readTarget = t.via ?? t.table;
     // Draining until a short page is an explicit while(true) — a long-running
     // fresh-install sync is exactly the case where off-by-one loop bugs hide.
     while (true) {
       const { data, error } = await sb
-        .from(t.table)
+        .from(readTarget)
         .select('data, updated_at')
         .gt('updated_at', cursor)
         .order('updated_at', { ascending: true })

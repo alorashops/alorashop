@@ -56,11 +56,17 @@ function extractMessage(value: unknown): string | undefined {
 
 /**
  * Idempotency keys guarantee a sale / ledger entry can never be double-submitted.
- * The key is generated once when the transaction first lands in IndexedDB and
+ * The key is generated once when the transaction first lands in PGlite and
  * reused for every outbox retry — the cloud layer upserts by this key.
+ *
+ * P11b (SECURITY_PLAN.md): the random part is the FULL crypto uuid rendered as
+ * 32 hex chars (128 bits). It used to be `uid().slice(0, 8)` — only 8 hex chars
+ * (32 bits), which looked safe solely because `uid()` was assumed strong. The
+ * key is opaque and unconstrained server-side (stored as
+ * `data.__idempotency_key`), so widening it needs no migration.
  */
 export function newIdempotencyKey(entity: 'SALE' | 'LEDGER' | 'RESTOCK' | 'VOID' | 'SUMMARY'): string {
-  return `${entity.toLowerCase()}_${Date.now().toString(36)}_${uid().slice(0, 8)}`;
+  return `${entity.toLowerCase()}_${Date.now().toString(36)}_${uid().replace(/-/g, '')}`;
 }
 
 export function isRetryableError(_err: unknown): boolean {

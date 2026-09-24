@@ -6,8 +6,8 @@ import type { Product, ProductCosting } from '../../types';
 
 /**
  * Products + restricted costing subcollection.
- * Costing stays in a separate Dexie table so the UI layer can simply refuse to
- * mount that data for cashiers — mirroring the Firestore document split.
+ * Costing stays in a separate PGlite table so the UI layer can simply refuse to
+ * mount that data for cashiers — the server mirrors this with role-gated product_costing policies (migration 03).
  */
 
 export async function getAllProducts(shopId: string): Promise<Product[]> {
@@ -236,7 +236,7 @@ export async function restockProduct(
         // it, so WAC silently trailed reality after every restock. The stale cost
         // then fed stock value (getStockValue, WAC-based) and profit backfill on
         // every device. Wire it when a purchase unit cost is supplied (Finding 1
-        // secondary gap). Dexie nests this within the active transaction, so the
+        // secondary gap). PGlite nests this within the active transaction, so the
         // costing write commits atomically with the restock.
         if (typeof unitCost === 'number' && unitCost > 0) {
           await applyWeightedAverageCost(productId, qty, unitCost);

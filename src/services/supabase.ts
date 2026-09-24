@@ -41,8 +41,10 @@ export async function updateShopName(newName: string): Promise<void> {
 
 let clientPromise: Promise<SupabaseClient> | undefined;
 
-/** Lazily build the shared client. Throws if .env is not configured. */
-function getSupabase(): Promise<SupabaseClient> {
+/** Lazily build the shared Supabase client. Throws if .env is not configured.
+    Exported so the Paystack verify caller reuses the SAME client (and therefore
+    the persisted auth session / user JWT) for authenticated function calls. */
+export function getSupabase(): Promise<SupabaseClient> {
   if (!isSupabaseConfigured) {
     return Promise.reject(new Error('Supabase is not configured. Add VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY to .env'));
   }
@@ -179,17 +181,28 @@ export async function createShop(shopName: string, phone?: string): Promise<stri
  *
  * The admin supplies an initial (temporary) password. The server creates a
   * CONFIRMED user with that password directly — there is NO expiring invite
-  * link to wait on, so the new hire can sign in immediately.
-  *
-  * Returns the new user's id.
+ * link to wait on, so the new hire can sign in immediately.
+ *
+ * P10b: `actorPassword` is the CALLER's own current password. The server
+ * verifies it against the caller's stored hash before doing anything, so a
+ * stolen session alone cannot mint accounts. Passwords are never stored here.
+ *
+ * Returns the new user's id.
  */
-export async function addStaff(email: string, displayName: string, role: Role, password: string): Promise<string> {
+export async function addStaff(
+  email: string,
+  displayName: string,
+  role: Role,
+  password: string,
+  actorPassword: string
+): Promise<string> {
   const sb = await getSupabase();
   const { data, error } = await sb.rpc('add_staff', {
     staff_email: email.trim(),
     staff_name: displayName.trim(),
     staff_role: role,
-    staff_password: password
+    staff_password: password,
+    actor_password: actorPassword
   });
   if (error) throw error;
   return data as string;
@@ -200,12 +213,17 @@ export async function addStaff(email: string, displayName: string, role: Role, p
  * `reset_staff_password` RPC) supplies a new temporary password directly. This
  * is the app's only password-recovery path: no links, no expiry, nothing to
  * wait for. The admin shares the new password with the staff member in person.
+ *
+ * P10b: `actorPassword` is the CALLER's own current password, verified
+ * server-side before the reset — a stolen admin session alone cannot take over
+ * another account. Passwords are never stored here.
  */
-export async function resetStaffPassword(uid: string, newPassword: string): Promise<void> {
+export async function resetStaffPassword(uid: string, newPassword: string, actorPassword: string): Promise<void> {
   const sb = await getSupabase();
   const { error } = await sb.rpc('reset_staff_password', {
     target_user_id: uid,
-    new_password: newPassword
+    new_password: newPassword,
+    actor_password: actorPassword
   });
   if (error) throw error;
 }

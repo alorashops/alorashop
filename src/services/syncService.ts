@@ -17,11 +17,13 @@ import { useAuthStore, shopIdOf, canSeeCosting } from '../stores/authStore';
 import { todayKey, isCloudShopId } from '../lib/utils';
 import { autoBackfillProfit } from '../db/repos/summary';
 import { buildCloudRows, upsertCloudRows, collapseDuplicates, pullCloudChanges, type PulledChange, type CloudRow } from './supabaseSync';
+import { verifyPayment } from './paystackVerify';
+import { confirmPayment } from '../db/repos/sales';
 
 /**
  * Background sync worker.
  *
- * - Flushes the IndexedDB outbox to Supabase in BATCHED upserts (many rows per
+ * - Flushes the local PGlite outbox to Supabase in BATCHED upserts (many rows per
  *   request). Rows keep their local `id` and are upserted ON CONFLICT (id), so
  *   retries reuse the same row and can never double-submit.
  * - Delta-pulls only rows newer than the device cursor (epoch ms — matches the
@@ -34,6 +36,52 @@ let running = false;
     than started — it would double quota reads and cause redundant refreshes.
     Mirrors the `running` guard on flushOutbox. */
 let pullRunning = false;
+
+/** P9 recovery guard: never run two verification sweeps at once. */
+let verifyingCardSales = false;
+
+/**
+ * P9 - promote card sales that were charged but whose row only just reached
+ * the cloud.
+ *
+ * The POS charges BEFORE its sale has synced, so the cashier's immediate
+ * verify answers `sale_not_synced`. Once this flush HAS written the rows,
+ * re-verify exactly those and mirror a confirmed PAID locally (confirmPayment).
+ * Scoped to the rows this flush wrote - no table scan, no new index.
+ *
+ * Idempotent: the function returns `already_paid` for a row the webhook (or an
+ * earlier sweep) already promoted, and confirmPayment no-ops unless the local
+ * sale is still PENDING. Failures are swallowed - the Paystack webhook and the
+ * next flush are the backstops.
+ */
+async function verifyJustSyncedCardSales(written: CloudRow[]): Promise<void> {
+  if (verifyingCardSales) return;
+  verifyingCardSales = true;
+  try {
+    for (const row of written) {
+      if (row.entityType !== 'SALE') continue;
+      const sale = await db.sales.get(row.id);
+      if (!sale || sale.paymentStatus !== 'PENDING_VERIFICATION') continue;
+      // `createSale` does NOT stamp `sale.paystackReference` - only
+      // `confirmPayment` does, i.e. AFTER a promotion. On a sale that has never
+      // been confirmed the reference lives on its CARD/PAYSTACK split, so
+      // reading `sale.paystackReference` alone made this hook skip exactly the
+      // case it exists for (still PENDING, no stamp yet).
+      const reference =
+        sale.paystackReference ??
+        sale.payments.find(
+          (p) => (p.method === 'CARD' || p.method === 'PAYSTACK') && !!p.reference
+        )?.reference;
+      if (!reference) continue;
+      const res = await verifyPayment(reference, sale);
+      if (res.verified) await confirmPayment(sale.id, reference);
+    }
+  } catch {
+    /* best-effort; the webhook / next flush retries */
+  } finally {
+    verifyingCardSales = false;
+  }
+}
 
 export async function flushOutbox(force = false): Promise<number> {
   if (running && !force) return 0;
@@ -110,6 +158,12 @@ export async function flushOutbox(force = false): Promise<number> {
     for (const entryId of mergedEntries) {
       await removeOutboxEntry(entryId);
     }
+
+    // P9: a card sale is charged BEFORE its row reaches the cloud, so the
+    // cashier's immediate verify answers `sale_not_synced`. Now that these rows
+    // HAVE landed, re-verify exactly them and mirror a confirmed PAID locally.
+    // (The Paystack webhook is the other recovery path.)
+    await verifyJustSyncedCardSales(written);
 
     // Push must NOT advance the delta watermark. A push says nothing about what
     // has been pulled/applied, and stamping the cursor with the local clock

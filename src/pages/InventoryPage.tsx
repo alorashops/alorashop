@@ -297,7 +297,7 @@ export default function InventoryPage() {
           )}
           {!seeCost && (
             <p style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              Costing fields are hidden for cashier accounts (document splitting enforced in Firestore rules).
+              Costing fields are hidden for cashier accounts (enforced server-side by RLS and role-gated product_costing policies; this screen is only a UX convenience).
             </p>
           )}
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 8 }}>

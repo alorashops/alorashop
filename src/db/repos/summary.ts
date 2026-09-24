@@ -66,20 +66,28 @@ export async function getSummariesRange(shopId: string, fromDate: string, toDate
       };
       byDay.set(date, sum);
     }
+    // P6e: an uncollected (PENDING_VERIFICATION) sale is a real recorded sale —
+    // it still increments salesCount and still shows in the Sales list — but its
+    // money is UNREALIZED: it contributes NO revenue, by-method total, profit or
+    // top-seller ranking until server-side verification (P9) promotes it to PAID.
+    // CREDIT_OPEN (a receivable) is out of P6e scope and remains counted.
+    const collected = sale.paymentStatus !== 'PENDING_VERIFICATION';
     sum.salesCount += 1;
-    sum.totalRevenue += sale.totalAmount;
-    // Profit is restricted data that exists ONLY where a manager backfill
-    // attached `sale.profit` locally — exactly the old summary semantics
-    // (devices without a backfill show GH₵0 until one runs).
-    sum.totalProfit += sale.profit ?? 0;
-    sum.totalsByMethod[sale.paymentMethod] = (sum.totalsByMethod[sale.paymentMethod] ?? 0) + sale.totalAmount;
-    for (const it of sale.items) {
-      const found = sum.topSelling.find((x) => x.productId === it.productId);
-      if (found) {
-        found.qty += it.quantity;
-        found.revenue += it.lineTotal;
-      } else {
-        sum.topSelling.push({ productId: it.productId, productName: it.productName, qty: it.quantity, revenue: it.lineTotal });
+    if (collected) {
+      sum.totalRevenue += sale.totalAmount;
+      // Profit is restricted data that exists ONLY where a manager backfill
+      // attached `sale.profit` locally — exactly the old summary semantics
+      // (devices without a backfill show GH₵0 until one runs).
+      sum.totalProfit += sale.profit ?? 0;
+      sum.totalsByMethod[sale.paymentMethod] = (sum.totalsByMethod[sale.paymentMethod] ?? 0) + sale.totalAmount;
+      for (const it of sale.items) {
+        const found = sum.topSelling.find((x) => x.productId === it.productId);
+        if (found) {
+          found.qty += it.quantity;
+          found.revenue += it.lineTotal;
+        } else {
+          sum.topSelling.push({ productId: it.productId, productName: it.productName, qty: it.quantity, revenue: it.lineTotal });
+        }
       }
     }
     if (sale.createdAt > sum.lastUpdatedAt) sum.lastUpdatedAt = sale.createdAt;
@@ -120,7 +128,7 @@ async function backfillSalesWindow(
   const sales = await db.sales
     .where('shopId')
     .equals(shopId)
-    .and((s) => s.createdAt >= startMs && s.createdAt < endMs && !s.voidedBy)
+    .and((s) => s.createdAt >= startMs && s.createdAt < endMs && !s.voidedBy && s.paymentStatus !== 'PENDING_VERIFICATION')
     .toArray();
   if (sales.length === 0) return 0;
 
@@ -332,6 +340,9 @@ export async function getTopSellingRange(shopId: string, fromDate: string, toDat
   const map = new Map<string, TopSellingItem>();
 
   for (const sale of sales) {
+    // P6e: uncollected (PENDING_VERIFICATION) sales are unrealized — they do
+    // not rank in top sellers (no qty, revenue or profit) until promoted to PAID.
+    if (sale.paymentStatus === 'PENDING_VERIFICATION') continue;
     // Remainder-corrected per-line discount allocation, keyed by the line
     // object itself (identity) — rebuilt fresh for every sale, never leaks.
     const alloc = new Map<SaleItem, number>();

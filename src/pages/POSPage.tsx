@@ -4,11 +4,14 @@ import { useCartStore, cartSubtotal, cartTotal, changeDue, parseMoneyInput } fro
 import { useInventoryStore } from '../stores/inventoryStore';
 import { useUiStore } from '../stores/uiStore';
 import { findProductByBarcode } from '../db/repos/products';
-import { createSale } from '../db/repos/sales';
+import { createSale, confirmPayment, getSaleById } from '../db/repos/sales';
 import { searchCustomers, getCustomerById, isCreditAllowed } from '../db/repos/customers';
 import { attachProductScanHandler } from '../services/barcodeService';
+import { chargeCardOrPaystack } from '../services/paystack';
+import { verifyPayment } from '../services/paystackVerify';
+import { flushOutbox } from '../services/syncService';
 import { fmtMoney } from '../lib/utils';
-import type { Customer, PaymentMethod, PaymentStatus } from '../types';
+import type { Customer, PaymentMethod, PaymentStatus, Sale } from '../types';
 
 export default function POSPage() {
   const user = useAuthStore((s) => s.user);
@@ -109,39 +112,100 @@ export default function POSPage() {
       return;
     }
     const primary: PaymentMethod = payments[0]?.method ?? 'CASH';
-    // Payment-status machine — the three states are distinct and each must be
-    // produced:
-    //  - PAYSTACK split  → PENDING_VERIFICATION (funds not confirmed; needs a
-    //    server-side verify — Spark limitation).
-    //  - CREDIT split    → CREDIT_OPEN (the tab is a receivable, not collected
-    //    money — must never show as PAID).
-    //  - otherwise       → PAID.
-    // Previously a pure-credit sale was stored as 'PAID', silently reporting
-    // collected money for an unpaid tab (CREDIT_OPEN was dead code).
-    const status: PaymentStatus = payments.some((p) => p.method === 'PAYSTACK')
-      ? 'PENDING_VERIFICATION'
-      : payments.some((p) => p.method === 'CREDIT')
-        ? 'CREDIT_OPEN'
-        : 'PAID';
 
     setSubmitting(true);
     try {
-      const sale = await createSale({
-        shopId: shopIdOf(),
-        cashierId: user?.uid ?? 'unknown',
-        cashierName: user?.displayName,
-        items: cart.lines.map((l) => ({
-          productId: l.productId,
-          productName: l.name,
-          quantity: l.quantity,
-          unitPrice: l.unitPrice,
-          lineTotal: l.unitPrice * l.quantity
-        })),
-        discount: cart.discount,
-        payments,
-        primaryMethod: primary,
-        paymentStatus: status
-      });
+      // P9 — CARD/PAYSTACK require a REAL Paystack charge, and the sale is NEVER
+      // marked PAID by the client. Steps:
+      //   1. Charge via Paystack Inline -> get a genuine `reference`.
+      //   2. Save the sale as PENDING_VERIFICATION (durable; excluded from
+      //      revenue by migration 13).
+      //   3. Ask the verify-payment Edge Function to confirm the reference with
+      //      the secret key; on `verified`, promote locally to PAID (mirroring
+      //      the server flip). If verification can't complete, the sale stays
+      //      PENDING until a manager / the Paystack webhook promotes it.
+      const chargeSplits = payments.filter((p) => p.method === 'CARD' || p.method === 'PAYSTACK');
+      let finalSale: Sale | undefined;
+
+      if (chargeSplits.length > 0) {
+        const chargeAmount = chargeSplits.reduce((s, p) => s + p.amount, 0);
+        const charge = await chargeCardOrPaystack(chargeAmount);
+        if (charge.status !== 'success') {
+          toast.push(
+            'error',
+            `Card/Paystack payment was not completed${charge.message ? ` — ${charge.message}` : ''}. No sale was recorded.`
+          );
+          return; // finally() resets submitting — nothing deducted
+        }
+        payments = payments.map((p) =>
+          (p.method === 'CARD' || p.method === 'PAYSTACK') ? { ...p, reference: charge.reference } : p
+        );
+
+        // Record PENDING first (never PAID from the client).
+        const pendingSale = await createSale({
+          shopId: shopIdOf(),
+          cashierId: user?.uid ?? 'unknown',
+          cashierName: user?.displayName,
+          items: cart.lines.map((l) => ({
+            productId: l.productId,
+            productName: l.name,
+            quantity: l.quantity,
+            unitPrice: l.unitPrice,
+            lineTotal: l.unitPrice * l.quantity
+          })),
+          discount: cart.discount,
+          payments,
+          primaryMethod: primary,
+          paymentStatus: 'PENDING_VERIFICATION'
+        });
+
+        // Server-authoritative verification.
+        //
+        // P9: the Edge Function only promotes a sale whose row is ALREADY in the
+        // cloud, and nothing flushed the outbox between createSale() and here
+        // (the sync loop flushes on a 15s timer), so this verify answered
+        // `sale_not_synced` on EVERY card sale - the cashier got a false
+        // 'not yet verified' warning for a charge that had already succeeded.
+        // Push this sale first: batched, idempotent upsert keyed on the local
+        // id; flushOutbox never throws, and skips (returns 0) when a flush is
+        // already in flight.
+        await flushOutbox();
+        const verify = await verifyPayment(charge.reference, pendingSale);
+        if (verify.verified) {
+          await confirmPayment(pendingSale.id, charge.reference);
+          // Re-read the AUTHORITATIVE row: the flush above runs the P9 sync
+          // sweep, which may already have promoted and confirmed this very sale
+          // (confirmPayment then no-ops and returns null). Falling back to the
+          // stale `pendingSale` object would report a PAID sale as PENDING.
+          finalSale = (await getSaleById(pendingSale.id)) ?? pendingSale;
+        } else {
+          toast.push(
+            'warn',
+            'Payment charged but not yet verified — sale is PENDING_VERIFICATION and won\u2019t count as revenue until a manager (or the Paystack webhook) confirms it.'
+          );
+          finalSale = pendingSale;
+        }
+      } else {
+        const status: PaymentStatus = payments.some((p) => p.method === 'CREDIT') ? 'CREDIT_OPEN' : 'PAID';
+        finalSale = await createSale({
+          shopId: shopIdOf(),
+          cashierId: user?.uid ?? 'unknown',
+          cashierName: user?.displayName,
+          items: cart.lines.map((l) => ({
+            productId: l.productId,
+            productName: l.name,
+            quantity: l.quantity,
+            unitPrice: l.unitPrice,
+            lineTotal: l.unitPrice * l.quantity
+          })),
+          discount: cart.discount,
+          payments,
+          primaryMethod: primary,
+          paymentStatus: status
+        });
+      }
+
+      const sale = finalSale;
       cart.setLastSaleId(sale.id);
       cart.clear();
       setStage('items');
@@ -564,6 +628,9 @@ export default function POSPage() {
                 }}
               >
                 💳 Card {cardCoverage > 0 ? `will charge ${fmtMoney(cardCoverage)} at completion` : 'sale fully covered'}
+                <div style={{ fontSize: 11, fontWeight: 500, marginTop: 4 }}>
+                  Secured by Paystack — the customer pays in a popup at completion.
+                </div>
               </div>
             )}
 
@@ -583,7 +650,7 @@ export default function POSPage() {
               >
                 🟢 Paystack {paystackCoverage > 0 ? `will charge ${fmtMoney(paystackCoverage)} at completion` : 'sale fully covered'}
                 <div style={{ fontSize: 11, fontWeight: 500, marginTop: 4 }}>
-                  Sale is marked PENDING_VERIFICATION — needs server-side verification (Spark limitation).
+                  Customer pays in a Paystack popup at completion; the sale is recorded PAID only after the payment succeeds.
                 </div>
               </div>
             )}
@@ -694,7 +761,7 @@ export default function POSPage() {
                 : `✔ Complete Sale — ${fmtMoney(total)}${remaining > 0 ? ` · due ${fmtMoney(remaining)}` : creditCovered > 0 ? ` · ${fmtMoney(creditCovered)} on tab` : ''}`}
             </button>
             <p style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', margin: '8px 0 0' }}>
-              Sale is durable in IndexedDB the instant you tap — cloud sync is backup only.
+              Sale is durable on this device the instant you tap — cloud sync is backup only.
             </p>
           </div>
         </div>

@@ -19,7 +19,7 @@ export interface CreateSaleInput {
 
 /**
  * Atomic sale creation. A sale is durable the instant this transaction commits
- * to IndexedDB — cloud sync is purely a backup layer.
+ * to local PGlite — cloud sync is purely a backup layer.
  */
 export async function createSale(input: CreateSaleInput): Promise<Sale> {
   const now = input.createdAt ?? Date.now();
@@ -148,23 +148,106 @@ export async function createSale(input: CreateSaleInput): Promise<Sale> {
   return sale;
 }
 
-/** Incremental summary update — ONE doc per shop per day, per the free-tier spec. */
+/**
+ * P9 — promote a PENDING_VERIFICATION sale to PAID after the verify-payment Edge
+ * Function confirms the Paystack reference server-side.
+ *
+ * This is the CLIENT'S HALF of the authority split: the Edge Function flips the
+ * CLOUD row to PAID (service role); this flips the LOCAL row to match AND bumps
+ * `updatedAt` so the outbox re-pushes a PAID sale with a NEWER timestamp than the
+ * original PENDING push — otherwise the older PENDING outbox row would clobber
+ * the server's PAID state back to PENDING (upsert-on-id conflict). The local
+ * daily summary is credited for the money/top-sellers NOW (salesCount was already
+ * counted when the PENDING sale was created).
+ */
+export async function confirmPayment(saleId: string, reference: string): Promise<Sale | null> {
+  const sale = await db.sales.get(saleId);
+  if (!sale || sale.paymentStatus !== 'PENDING_VERIFICATION') return null;
+  const now = Date.now();
+  const paidSale: Sale = {
+    ...sale,
+    paymentStatus: 'PAID',
+    paystackReference: reference,
+    updatedAt: now,
+    payments: sale.payments.map((p) =>
+      (p.method === 'CARD' || p.method === 'PAYSTACK') ? { ...p, reference } : p
+    ),
+    syncedToCloud: false,
+    outboxRetryCount: 0
+  };
+
+  await db.transaction('rw', [db.sales, db.dailySummaries, db.outbox], async () => {
+    await db.sales.put(paidSale);
+
+    // Credit the daily summary for the newly collected money (append-only add).
+    const summaryId = `${sale.shopId}_${todayKey(new Date(sale.createdAt))}`;
+    const summary = await db.dailySummaries.get(summaryId);
+    if (summary) {
+      const byMethod: Record<PaymentMethod, number> = {
+        ...summary.totalsByMethod,
+        [sale.paymentMethod]: (summary.totalsByMethod[sale.paymentMethod] ?? 0) + sale.totalAmount
+      };
+      const topMap = new Map<string, { productId: string; productName: string; qty: number; revenue: number }>();
+      for (const it of sale.items) {
+        const cur = topMap.get(it.productId) ?? { productId: it.productId, productName: it.productName, qty: 0, revenue: 0 };
+        cur.qty += it.quantity;
+        cur.revenue += it.lineTotal;
+        topMap.set(it.productId, cur);
+      }
+      let topList = [...(summary.topSelling ?? [])];
+      for (const t of topMap.values()) {
+        const found = topList.find((x) => x.productId === t.productId);
+        if (found) { found.qty += t.qty; found.revenue += t.revenue; }
+        else topList.push(t);
+      }
+      const next: DailySummary = {
+        ...summary,
+        totalsByMethod: byMethod,
+        totalRevenue: (summary.totalRevenue ?? 0) + sale.totalAmount,
+        totalProfit: (summary.totalProfit ?? 0) + (sale.profit ?? 0),
+        topSelling: topList.sort((a, b) => b.qty - a.qty).slice(0, 10),
+        lastUpdatedAt: now
+      };
+      await db.dailySummaries.put(next);
+      await enqueueDailySummary(next);
+    }
+
+    // Re-push the PAID sale so it converges on the cloud with a NEWER timestamp.
+    await db.outbox.add({
+      id: uid(),
+      idempotencyKey: sale.idempotencyKey,
+      entityType: 'SALE',
+      payload: paidSale,
+      status: 'PENDING',
+      retryCount: 0,
+      createdAt: now
+    });
+  });
+
+  return paidSale;
+}
+
 export async function incrementDailySummary(shopId: string, sale: Sale): Promise<void> {
   const dateKey = todayKey(new Date(sale.createdAt));
   const id = `${shopId}_${dateKey}`;
   const existing = await db.dailySummaries.get(id);
   const base = existing?.totalsByMethod ?? { CASH: 0, CARD: 0, PAYSTACK: 0, CREDIT: 0 };
-  const byMethod: Record<PaymentMethod, number> = {
-    ...base,
-    [sale.paymentMethod]: (base[sale.paymentMethod] ?? 0) + sale.totalAmount
-  };
+  // P6e: an uncollected (PENDING_VERIFICATION) sale increments the recorded sale
+  // COUNT but contributes NO totalsByMethod/topSelling money — it is unrealized
+  // until server-side verification (P9) promotes it to PAID.
+  const collected = sale.paymentStatus !== 'PENDING_VERIFICATION';
+  const byMethod: Record<PaymentMethod, number> = collected
+    ? { ...base, [sale.paymentMethod]: (base[sale.paymentMethod] ?? 0) + sale.totalAmount }
+    : { ...base };
 
   const topMap = new Map<string, { productId: string; productName: string; qty: number; revenue: number }>();
-  for (const it of sale.items) {
-    const cur = topMap.get(it.productId) ?? { productId: it.productId, productName: it.productName, qty: 0, revenue: 0 };
-    cur.qty += it.quantity;
-    cur.revenue += it.lineTotal;
-    topMap.set(it.productId, cur);
+  if (collected) {
+    for (const it of sale.items) {
+      const cur = topMap.get(it.productId) ?? { productId: it.productId, productName: it.productName, qty: 0, revenue: 0 };
+      cur.qty += it.quantity;
+      cur.revenue += it.lineTotal;
+      topMap.set(it.productId, cur);
+    }
   }
   const topList = [...(existing?.topSelling ?? [])];
   for (const t of topMap.values()) {
@@ -181,8 +264,8 @@ export async function incrementDailySummary(shopId: string, sale: Sale): Promise
     date: dateKey,
     salesCount: (existing?.salesCount ?? 0) + 1,
     totalsByMethod: byMethod,
-    totalRevenue: (existing?.totalRevenue ?? 0) + sale.totalAmount,
-    totalProfit: (existing?.totalProfit ?? 0) + (sale.profit ?? 0),
+    totalRevenue: (existing?.totalRevenue ?? 0) + (collected ? sale.totalAmount : 0),
+    totalProfit: (existing?.totalProfit ?? 0) + (collected ? (sale.profit ?? 0) : 0),
     topSelling: topList.sort((a, b) => b.qty - a.qty).slice(0, 10),
     lastUpdatedAt: Date.now()
   };
@@ -315,35 +398,43 @@ export async function voidSale(saleId: string, actorId: string, reason?: string)
     // Reflect reversal in the daily summary (append-only; the original sale stays).
     const summary = await db.dailySummaries.get(`${sale.shopId}_${todayKey(new Date(sale.createdAt))}`);
     if (summary) {
-      // Reverse the items from topSelling — a voided sale's products must not
-      // keep counting toward "Top Selling" on the dashboard. Mirror of the
-      // aggregation in incrementDailySummary: subtract each line's qty/revenue
-      // and drop the entry entirely if it goes to zero (or below, on retries).
-      const topMap = new Map<string, { productId: string; productName: string; qty: number; revenue: number }>();
-      for (const it of sale.items) {
-        const cur = topMap.get(it.productId) ?? { productId: it.productId, productName: it.productName, qty: 0, revenue: 0 };
-        cur.qty -= it.quantity;
-        cur.revenue -= it.lineTotal;
-        topMap.set(it.productId, cur);
-      }
+      // P6e: an uncollected (PENDING_VERIFICATION) sale was never added to the
+      // summary's revenue/topSeller money, so voiding it must NOT subtract those
+      // (that would push totals negative). salesCount still decrements.
+      const collected = sale.paymentStatus !== 'PENDING_VERIFICATION';
       let topList = [...(summary.topSelling ?? [])];
-      for (const t of topMap.values()) {
-        const found = topList.find((x) => x.productId === t.productId);
-        if (found) {
-          found.qty += t.qty;
-          found.revenue += t.revenue;
-          if (found.qty <= 0) topList = topList.filter((x) => x.productId !== t.productId);
+      if (collected) {
+        // Reverse the items from topSelling — a voided sale's products must not
+        // keep counting toward "Top Selling" on the dashboard. Mirror of the
+        // aggregation in incrementDailySummary: subtract each line's qty/revenue
+        // and drop the entry entirely if it goes to zero (or below, on retries).
+        const topMap = new Map<string, { productId: string; productName: string; qty: number; revenue: number }>();
+        for (const it of sale.items) {
+          const cur = topMap.get(it.productId) ?? { productId: it.productId, productName: it.productName, qty: 0, revenue: 0 };
+          cur.qty -= it.quantity;
+          cur.revenue -= it.lineTotal;
+          topMap.set(it.productId, cur);
+        }
+        for (const t of topMap.values()) {
+          const found = topList.find((x) => x.productId === t.productId);
+          if (found) {
+            found.qty += t.qty;
+            found.revenue += t.revenue;
+            if (found.qty <= 0) topList = topList.filter((x) => x.productId !== t.productId);
+          }
         }
       }
 
       const nextSummary: DailySummary = {
         ...summary,
         salesCount: Math.max(0, summary.salesCount - 1),
-        totalRevenue: Math.max(0, summary.totalRevenue - sale.totalAmount),
-        totalProfit: Math.max(0, (summary.totalProfit ?? 0) - (sale.profit ?? 0)),
+        totalRevenue: Math.max(0, summary.totalRevenue - (collected ? sale.totalAmount : 0)),
+        totalProfit: Math.max(0, (summary.totalProfit ?? 0) - (collected ? (sale.profit ?? 0) : 0)),
         totalsByMethod: {
           ...summary.totalsByMethod,
-          [sale.paymentMethod]: Math.max(0, (summary.totalsByMethod[sale.paymentMethod] ?? 0) - sale.totalAmount)
+          [sale.paymentMethod]: collected
+            ? Math.max(0, (summary.totalsByMethod[sale.paymentMethod] ?? 0) - sale.totalAmount)
+            : (summary.totalsByMethod[sale.paymentMethod] ?? 0)
         },
         topSelling: topList.sort((a, b) => b.qty - a.qty).slice(0, 10),
         lastUpdatedAt: now

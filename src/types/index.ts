@@ -2,7 +2,7 @@
  * AloraShop — Domain model.
  * Mirrors the plain-text data model in the architecture spec exactly.
  * Local-only fields (outbox / sync metadata) are kept on the row so a sale is
- * "done" the moment it lands in IndexedDB.
+ * "done" the moment it lands in the local PGlite database.
  */
 
 export type Role = 'cashier' | 'manager' | 'admin';
@@ -73,6 +73,10 @@ export interface PaymentSplit {
   method: PaymentMethod;
   amount: number;
   customerId?: string; // required when method === 'CREDIT'
+  /** Paystack transaction reference — present on CARD/PAYSTACK splits after a
+      successful, verified inline charge (P9). Carries the proof that money was
+      really collected, and syncs with the sale so it is auditable. */
+  reference?: string;
 }
 
 export interface Sale {
@@ -90,6 +94,10 @@ export interface Sale {
   paymentStatus: PaymentStatus;
   createdAt: number;
   voidedBy?: string; // reversal doc id, if any
+  /** Paystack transaction reference for the CARD/PAYSTACK leg (P9). Set once the
+      charge happens; the sale stays PENDING_VERIFICATION until the verify-payment
+      Edge Function promotes it to PAID server-side. */
+  paystackReference?: string;
   // --- manager backfill (profit) ---
   /** Gross profit for the whole sale — attached by a manager profit backfill.
       Restricted data: only the device that ran the backfill has it. */
@@ -158,7 +166,7 @@ export interface UserProfile {
   uid: string;
   shopId: string;
   displayName: string;
-  role: Role; // UX convenience mirror — real enforcement lives in Firestore rules / claims
+  role: Role; // UX mirror only — the server is authoritative: profiles.role is immutable to self (migration 02) and RLS gates on it
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +176,7 @@ export interface OutboxEntry {
   id: string;
   idempotencyKey: string;
   entityType: OutboxEntity;
-  payload: unknown; // full document to write to Firestore
+  payload: unknown; // full camelCase document to upsert into the cloud mirror (see buildCloudRows)
   status: OutboxStatus;
   retryCount: number;
   createdAt: number;

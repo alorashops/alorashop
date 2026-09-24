@@ -8,7 +8,7 @@ import type { Product } from '../types';
  * USB/Bluetooth barcode scanners act as keyboard wedges: they emit a fast
  * character buffer terminated by ENTER. We capture that burst on `window`
  * (no input focus required), debounce the buffer, and resolve it against
- * products in IndexedDB instantly — zero network, zero focus management.
+ * products in the local PGlite database instantly — zero network, zero focus management.
  */
 interface BarcodeService {
   start: (onScan: (code: string) => void) => () => void;

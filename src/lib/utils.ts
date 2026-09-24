@@ -1,10 +1,41 @@
 /** Shared helpers — money, ids, dates, paging. */
 
+/**
+ * Builds an RFC-4122 v4 UUID from `crypto.getRandomValues` — the one Web
+ * Crypto primitive that (unlike `crypto.randomUUID`) is available in
+ * NON-secure contexts too, so plain-HTTP LAN deployments keep working.
+ */
+function uuidV4FromGetRandomValues(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC-4122 variant
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * Crypto-only id generator (P11, SECURITY_PLAN.md).
+ *
+ * `uid()` is the single source of every local primary key — sales, products,
+ * customers, stock ledger and outbox entries — and those ids are pushed to the
+ * cloud mirror AS the row id (`buildCloudRows`). The old fallback
+ * (`id_${Date.now()}_${Math.random()...}`) was BOTH non-cryptographic AND not a
+ * UUID, so on any device without `crypto.randomUUID` it would mint guessable
+ * primary keys in a shape the cloud contract does not accept.
+ *
+ * Order:
+ *   1. `crypto.randomUUID()`    — secure contexts (fast path, real UUID).
+ *   2. `crypto.getRandomValues` — universal; still a real v4 UUID.
+ *   3. otherwise THROW (fail-CLOSED). A predictable id / idempotency seed is
+ *      worse than a loud failure; `Math.random` is never used as a fallback.
+ */
 export const uid = (): string => {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return crypto.randomUUID();
+  if (typeof crypto !== 'undefined') {
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    if (typeof crypto.getRandomValues === 'function') return uuidV4FromGetRandomValues();
   }
-  return `id_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  throw new Error('Secure id generation unavailable: Web Crypto (crypto.getRandomValues) is missing.');
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -12,17 +43,6 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 /** True when shopId is a real Supabase shop uuid — the only shop that can sync. */
 export function isCloudShopId(shopId?: string | null): boolean {
   return typeof shopId === 'string' && UUID_RE.test(shopId);
-}
-
-/** Sequential receipt number per shop per day: SHOP-YYYYMMDD-0001 */
-export function makeReceiptNumber(shopId: string, date = new Date()): string {
-  const ymd = [
-    date.getFullYear(),
-    String(date.getMonth() + 1).padStart(2, '0'),
-    String(date.getDate()).padStart(2, '0')
-  ].join('');
-  const seq = Math.floor(Math.random() * 9000) + 1000; // overwritten by counter for true sequence
-  return `${shopId.slice(0, 6).toUpperCase()}-${ymd}-${seq}`;
 }
 
 export function todayKey(d = new Date()): string {
