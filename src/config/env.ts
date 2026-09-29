@@ -8,6 +8,14 @@
  */
 export const PAYSTACK_PUBLIC_KEY = import.meta.env.VITE_PAYSTACK_PUBLIC_KEY ?? '';
 
+/**
+ * Email Paystack uses as the payment contact on a POS charge when the customer
+ * has no email on file (the customer model only carries name/phone). Paystack
+ * requires a valid email on every inline transaction. Override via
+ * `VITE_PAYSTACK_BUSINESS_EMAIL`.
+ */
+export const PAYSTACK_BUSINESS_EMAIL = import.meta.env.VITE_PAYSTACK_BUSINESS_EMAIL ?? 'pos@alorashop.app';
+
 export const supabaseUrl = import.meta.env.VITE_SUPABASE_URL ?? '';
 export const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY ?? '';
 export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);

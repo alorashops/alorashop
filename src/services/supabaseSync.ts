@@ -15,6 +15,9 @@ import type { OutboxEntry } from '../types';
  *  - `updated_at` is epoch ms, so the delta pull compares against the same
  *    JS cursor the device already uses (the epoch-ms cursor both sides share).
  *  - The cloud is an append-only mirror: no delete grants in the migration.
+ *  - P12c-3: writes to `sales`/`daily_summaries` go through the owner-privileged
+ *    RPCs `upsert_sales`/`upsert_daily_summaries` (migration 23, see
+ *    WRITE_VIA_RPC), so raw SELECT can be revoked from `authenticated`.
  */
 
 export type CloudEntity =
@@ -109,6 +112,22 @@ const PULL_TABLES: Array<{ table: string; via?: string; entity: CloudEntity }> =
   { table: 'credit_ledger', entity: 'CREDIT_LEDGER' }
 ];
 
+/**
+ * P12c-3: tables whose writes go through an owner-privileged RPC (migration 23)
+ * instead of the PostgREST upsert, so raw SELECT can be revoked from
+ * `authenticated`. Maps table -> RPC name.
+ *
+ * WHY: PostgreSQL requires TABLE-LEVEL SELECT privilege for
+ * `INSERT … ON CONFLICT (id) DO UPDATE` (measured 2026-09-26; column-level SELECT
+ * is NOT sufficient and it is independent of RLS), so the plain PostgREST upsert
+ * cannot run once raw SELECT is revoked. The RPC performs the same upsert as the
+ * table owner and re-imposes the tenant check itself.
+ */
+const WRITE_VIA_RPC: Record<string, string> = {
+  sales: 'upsert_sales',
+  daily_summaries: 'upsert_daily_summaries'
+};
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 let client: SupabaseClient | undefined;
@@ -187,7 +206,10 @@ export async function upsertCloudRows(rows: CloudRow[]): Promise<CloudRow[]> {
         updated_at: r.updatedAt,
         data: r.data
       }));
-      const { error } = await sb.from(table).upsert(chunk, { onConflict: 'id' });
+      const rpc = WRITE_VIA_RPC[table];
+      const { error } = rpc
+        ? await sb.rpc(rpc, { p_rows: chunk })
+        : await sb.from(table).upsert(chunk, { onConflict: 'id' });
       if (error) {
         // Stash the already-accepted rows on the error so the flush catch can
         // finish their bookkeeping and only classify the unwritten remainder.
