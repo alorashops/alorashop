@@ -116,3 +116,35 @@ export function debounce<T extends (...args: never[]) => void>(fn: T, ms: number
   };
   return wrapped as T;
 }
+
+/**
+ * Password policy (P10a, SECURITY_PLAN.md): at least 8 characters AND one
+ * letter, one digit and one symbol (a non-alphanumeric, non-whitespace
+ * character). The SERVER enforces the same rule inside the staff RPCs
+ * (migration 25); this is the client-side mirror so the two never drift.
+ *
+ * NOTE: this governs NEW / CHANGED passwords only (signup + the admin staff
+ * RPCs). It must NOT gate LOGIN, or existing accounts whose stored password is
+ * shorter would be locked out.
+ */
+export const PASSWORD_MIN_LENGTH = 8;
+export const PASSWORD_POLICY_MESSAGE =
+  'Password must be at least 8 characters and include a letter, a number, and a symbol.';
+const PASSWORD_LETTER_RE = /[A-Za-z]/;
+const PASSWORD_DIGIT_RE = /[0-9]/;
+// Symbol = non-alphanumeric AND non-whitespace. The whitespace set is the ASCII
+// one (space \t \n \v \f \r) to match Postgres [:space:] in the server check
+// EXACTLY -- JS \s additionally matches Unicode spaces, which would make the
+// client stricter than the server for e.g. a non-breaking space.
+const PASSWORD_SYMBOL_RE = /[^A-Za-z0-9 \t\n\v\f\r]/;
+
+/** True when `pw` satisfies the P10a policy (mirror of the server check). */
+export function isStrongPassword(pw: string): boolean {
+  return (
+    typeof pw === 'string' &&
+    pw.length >= PASSWORD_MIN_LENGTH &&
+    PASSWORD_LETTER_RE.test(pw) &&
+    PASSWORD_DIGIT_RE.test(pw) &&
+    PASSWORD_SYMBOL_RE.test(pw)
+  );
+}

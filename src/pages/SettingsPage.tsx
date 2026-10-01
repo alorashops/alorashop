@@ -11,6 +11,7 @@ import { addStaff, resetStaffPassword } from '../services/supabase';
 import { Modal } from '../components/ui';
 import { isSupabaseConfigured } from '../config/env';
 import { useInstallPrompt } from '../hooks/useInstallPrompt';
+import { isStrongPassword, PASSWORD_POLICY_MESSAGE } from '../lib/utils';
 import type { UserProfile, Role } from '../types';
 
 const ROLE_MATRIX: Array<[string, string, boolean, boolean, boolean]> = [
@@ -206,8 +207,8 @@ export default function SettingsPage() {
       toast.push('warn', 'Please fill in the name and email.');
       return;
     }
-    if (staffPassword.length < 6) {
-      toast.push('warn', 'Temporary password must be at least 6 characters.');
+    if (!isStrongPassword(staffPassword)) {
+      toast.push('warn', `Temporary password: ${PASSWORD_POLICY_MESSAGE}`);
       return;
     }
     if (!staffActorPassword) {
@@ -242,8 +243,8 @@ export default function SettingsPage() {
    */
   const handleResetStaffPassword = async () => {
     if (!resetFor) return;
-    if (resetPassword.length < 6) {
-      toast.push('warn', 'New password must be at least 6 characters.');
+    if (!isStrongPassword(resetPassword)) {
+      toast.push('warn', `New password: ${PASSWORD_POLICY_MESSAGE}`);
       return;
     }
     if (!resetActorPassword) {
@@ -446,8 +447,8 @@ export default function SettingsPage() {
               type="text"
               value={staffPassword}
               onChange={(e) => setStaffPassword(e.target.value)}
-              placeholder="At least 6 characters"
-              minLength={6}
+              placeholder="At least 8 characters (letter, number, symbol)"
+              minLength={8}
               required
             />
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
@@ -501,8 +502,8 @@ export default function SettingsPage() {
               type="text"
               value={resetPassword}
               onChange={(e) => setResetPassword(e.target.value)}
-              placeholder="At least 6 characters"
-              minLength={6}
+              placeholder="At least 8 characters (letter, number, symbol)"
+              minLength={8}
               autoFocus
             />
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>

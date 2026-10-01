@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { isStrongPassword, PASSWORD_POLICY_MESSAGE } from '../lib/utils';
 import { useNavigate, Navigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
 
@@ -61,6 +62,13 @@ function AuthShell() {
     const submit = async (e: React.FormEvent) => {
       e.preventDefault();
       setError('');
+      // P10a: enforce the strength policy on SIGNUP only. Login must never be
+      // gated here, or existing accounts whose stored password is shorter than
+      // 8 characters would be locked out of the app.
+      if (mode === 'signup' && !isStrongPassword(password)) {
+        setError(PASSWORD_POLICY_MESSAGE);
+        return;
+      }
       setBusy(true);
       try {
         const auth = useAuthStore.getState();
@@ -131,9 +139,9 @@ function AuthShell() {
               type={showPassword ? 'text' : 'password'}
               {...field(password, setPassword)}
               style={{ ...inputStyle, marginTop: 0, paddingRight: 44 }}
-              placeholder="At least 6 characters"
+              placeholder={mode === 'login' ? 'Your password' : 'At least 8 characters (letter, number, symbol)'}
               autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-              minLength={6}
+              minLength={mode === 'login' ? undefined : 8}
               required
             />
             <button

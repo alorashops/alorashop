@@ -1,6 +1,6 @@
 # AloraShop — Supabase backend
 
-Everything the app needs on the server: **23 versioned SQL migrations** plus one
+Everything the app needs on the server: **26 versioned SQL migrations** plus one
 **Edge Function** (`verify-payment`). None of it is optional — the SQL files carry
 the RLS policies, the SECURITY DEFINER hardening and the payment guards.
 
@@ -42,6 +42,9 @@ New query → paste → Run, one at a time):
 | 20 | `restore_sales_receipt_uniqueness` | **restore the receipt safety net** — migration 10 aborted on a pre-existing duplicate, so its unique index never existed; resolve the duplicate then `CREATE UNIQUE INDEX IF NOT EXISTS` (P14) |
 | 21 | `repair_p13b_self_renamed_receipts` | repair the 6 receipts the pre-P13 trigger renamed to themselves (`…-000N-2` → `…-000N`) (P13b) |
 | 22 | `anon_lockdown_complete` | **close the anon surface on VIEWS + sequences** and make the default-privilege revoke durable for tables/sequences/functions (P12c-2 completion + F3) |
+| 23 | `p12c3_owner_write_rpcs` | **owner write RPCs** — `upsert_sales(jsonb)` / `upsert_daily_summaries(jsonb)`, `SECURITY DEFINER` with a pinned `search_path` + a fail-loud tenant gate; lets the client write `sales`/`daily_summaries` without raw table `SELECT` (P12c-3 phase 1; additive) |
+| 24 | `p12c3_revoke_raw_select` | **close the cashier-margin leak** — rebuild `sales_secure` / `daily_summaries_secure` as `SECURITY DEFINER` with an explicit `shop_id = current_shop_id()` predicate, then `REVOKE SELECT` on the raw `sales` / `daily_summaries` from `authenticated` (P12c-3 phase 2) |
+| 25 | `p10a_password_policy` | **raise the staff password policy** — `add_staff` / `reset_staff_password` now require ≥ 8 chars with a letter, a number and a symbol (P10a; signatures and the P10b re-auth logic unchanged). Existing credentials keep working |
 
 ### Two traps that already bit us
 
@@ -124,15 +127,23 @@ verification blocks). The repo also ships executable checks:
 | `node scripts/verify_p14_receipt_uniqueness.mjs` | 24/24 |
 | `node scripts/verify_p13b_self_rename_repair.mjs` | 21/21 |
 | `node scripts/verify_p12c2b_anon_lockdown_complete.mjs` | 18/18 |
+| `node scripts/verify_p12c3_privilege_matrix.mjs` | 14/14 |
+| `node scripts/verify_p12c3_write_rpc.mjs` | 30/30 |
+| `node scripts/verify_p12c3_client_wiring.mjs` | 11/11 |
+| `node scripts/verify_p12c3_revoke_raw_select.mjs` | 21/21 |
+| `node scripts/verify_p10b_reauth_migration.mjs` | 22/22 |
+| `node scripts/verify_p10a_password_policy.mjs` | 28/28 |
 | `scripts/verify_p10c_live_reconcile.sql` (SQL editor) | all checks true |
 | `scripts/verify_p14_applied.sql` (SQL editor) | Sections 1 & 2 = 0 rows |
 | `scripts/verify_p13b_applied.sql` (SQL editor) | Sections 1–4 = 0 rows |
 | `scripts/verify_p12c_lockdown_complete_applied.sql` (SQL editor) | Sections 1 & 2 = 0 rows; Section 3 = 0 rows or the documented `supabase_admin` residual |
+| `scripts/verify_p12c3_applied.sql` (SQL editor) | Section 1 = 0 rows; Section 2 = 2 rows |
+| `scripts/verify_p12c3_phase2_applied.sql` (SQL editor) | Section 1 = 0 rows |
 
 ## 6. What changes for staff once deployed
 
-- Adding a staff member from Settings needs a **temporary password** (min 6
-  chars) instead of an invite email.
+- Adding a staff member from Settings needs a **temporary password** (min 8
+  chars, with a letter, a number and a symbol — P10a) instead of an invite email.
 - Any admin can reset any staff password from Settings → Staff, and since
   migration 16 must re-enter **their own** password to do it.
 - Staff sign in with email + password exactly like the shop owner.
