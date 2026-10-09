@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, Component, useEffect, useState, type ReactNode } from 'react';
 import { HashRouter, Routes, Route, Navigate, NavLink } from 'react-router-dom';
 import { useAuthStore, shopIdOf } from './stores/authStore';
 import { useSyncStore } from './stores/syncStore';
@@ -9,6 +9,9 @@ import { seedIfEmpty, purgeDemoData } from './services/seedService';
 import { startSyncLoop } from './services/syncService';
 import { subscribeLowStock } from './stores/inventoryStore';
 import { Toasts, ConfirmDialog } from './components/overlays';
+import { EmptyState } from './components/ui';
+import { getMyUnreadCount } from './services/affiliate';
+import { lazyRetry } from './lib/lazyRetry';
 import { ReceiptModal } from './components/ReceiptModal';
 import { InstallPromptPopup } from './components/InstallPromptPopup';
 import LoginPage from './pages/LoginPage';
@@ -18,6 +21,38 @@ import SalesPage from './pages/SalesPage';
 import AnalyticsPage from './pages/AnalyticsPage';
 import CustomersPage from './pages/CustomersPage';
 import SettingsPage from './pages/SettingsPage';
+
+// Affiliate (S9) is ONLINE-ONLY and shipped as its OWN lazy chunk, which is
+// EXCLUDED from the service-worker precache (vite.config.ts). So the offline
+// shell never carries it; offline the lazy import fails and AffiliateBoundary
+// renders a friendly "needs a connection" card.
+//
+// S11b: lazyRetry() turns the POST-DEPLOY case (a stale shell asking for a chunk
+// hash that no longer exists) into ONE transparent reload instead of a false
+// "needs a connection" card. It is loop-proof (sessionStorage-guarded).
+const AffiliatePage = lazy(lazyRetry(() => import('./pages/AffiliatePage')));
+
+/** Catches a failed lazy chunk load (offline) and shows a graceful message. */
+class AffiliateBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="card">
+          <EmptyState
+            icon="🔌"
+            title="Affiliate needs a connection"
+            hint="This page loads online only. Reconnect, then open Affiliate again."
+          />
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function NavBadge({ path, label, icon, badge }: { path: string; label: string; icon: string; badge?: number }) {
   return (
@@ -63,6 +98,25 @@ function Shell() {
     if (shopId) void useShopStore.getState().refresh();
   }, [shopId]);
 
+  // Affiliate unread badge (S9). Online-only + non-fatal: a failure just means
+  // no badge, never a broken shell. Refreshes when connectivity flips on.
+  const [affiliateUnread, setAffiliateUnread] = useState(0);
+  useEffect(() => {
+    if (!online) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const n = await getMyUnreadCount();
+        if (!cancelled) setAffiliateUnread(n);
+      } catch {
+        /* non-fatal — no badge */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [online, shopId]);
+
   // No session, or session without a shop yet -> auth/create-shop flow.
   if (!user || !user.shopId) return <Navigate to="/login" replace />;
 
@@ -80,6 +134,7 @@ function Shell() {
           <NavBadge path="/sales" label="Sales" icon="🧾" />
           <NavBadge path="/customers" label="Customers" icon="👥" />
           <NavBadge path="/analytics" label="Analytics" icon="📊" />
+          <NavBadge path="/affiliate" label="Affiliate" icon="💸" badge={affiliateUnread} />
           <NavBadge path="/settings" label="Settings" icon="⚙️" />
         </nav>
         <div className="foot">
@@ -128,6 +183,16 @@ function Shell() {
             <Route path="/sales" element={<SalesPage />} />
             <Route path="/customers" element={<CustomersPage />} />
             <Route path="/analytics" element={<AnalyticsPage />} />
+            <Route
+              path="/affiliate"
+              element={
+                <AffiliateBoundary>
+                  <Suspense fallback={<div className="card">Loading Affiliate…</div>}>
+                    <AffiliatePage />
+                  </Suspense>
+                </AffiliateBoundary>
+              }
+            />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/pos" replace />} />
           </Routes>

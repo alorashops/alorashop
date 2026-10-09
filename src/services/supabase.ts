@@ -176,6 +176,29 @@ export async function createShop(shopName: string, phone?: string): Promise<stri
 }
 
 /**
+ * S3b: creates a shop AND atomically attributes it to a referral code (migration
+ * 028 `create_shop_with_referral`). It is a strict superset of `create_shop`:
+ * without a code it behaves identically, with one it also stamps the shop and
+ * inserts the `affiliate.referred_shops` link in the SAME transaction. The server
+ * REJECTS malformed/unknown codes and self-referral — before it creates anything
+ * — so a caller may safely fall back to `createShop` on such a rejection.
+ */
+export async function createShopWithReferral(
+  shopName: string,
+  phone: string | undefined,
+  referralCode: string
+): Promise<string> {
+  const sb = await getSupabase();
+  const { data, error } = await sb.rpc('create_shop_with_referral', {
+    shop_name: shopName,
+    phone: phone ?? null,
+    referred_by_code: referralCode
+  });
+  if (error) throw error;
+  return data as string; // the new shop_id
+}
+
+/**
  * Adds a staff member via the SECURITY DEFINER RPC. Role guardrails run
  * server-side: admin may add manager/cashier, manager may add cashier only.
  *

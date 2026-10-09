@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { isStrongPassword, PASSWORD_POLICY_MESSAGE } from '../lib/utils';
 import { useNavigate, Navigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
+import { getCapturedReferral } from '../lib/referral';
 
 const inputStyle: React.CSSProperties = {
   width: '100%',
@@ -184,6 +185,9 @@ function CreateShop({ displayName }: { displayName: string }) {
   const [phone, setPhone] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  // S3b: surfaced (not hidden) so the user can see the referral that will be
+  // attributed when they name their shop. Captured on first load (main.tsx).
+  const [referral] = useState(() => getCapturedReferral());
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -214,6 +218,11 @@ function CreateShop({ displayName }: { displayName: string }) {
           <label style={labelStyle}>Shop phone (optional)</label>
           <input value={phone} onChange={(e) => setPhone(e.target.value)} style={inputStyle} placeholder="e.g. 0244 000 000" inputMode="tel" />
         </div>
+        {referral && (
+          <div style={{ fontSize: 12, color: 'var(--text-muted, #64748b)' }}>
+            Referred by <strong>{referral}</strong> — this shop will be linked to them.
+          </div>
+        )}
         {error && <div style={{ color: '#dc2626', fontSize: 13 }}>{error}</div>}
         <button className="btn" type="submit" disabled={busy} style={{ padding: '12px 0', fontWeight: 800 }}>
           {busy ? 'Creating shop…' : 'Create my shop'}

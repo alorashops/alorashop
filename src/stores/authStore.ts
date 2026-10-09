@@ -11,8 +11,12 @@ import {
   signUp,
   signOut,
   createShop as rpcCreateShop,
+  createShopWithReferral as rpcCreateShopWithReferral,
   type AuthProfile
 } from '../services/supabase';
+import { getCapturedReferral, clearCapturedReferral, isReferralRejection } from '../lib/referral';
+import { smartWipeForLogout } from '../db/repos/privacy';
+import { useUiStore } from './uiStore';
 
 interface AuthState {
   user: AppUser | null;
@@ -208,7 +212,26 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
   },
 
   createShop: async (name: string, phone?: string) => {
-    await rpcCreateShop(name, phone);
+    // S3b: if this device arrived via a referral link (`?ref=CODE`), attribute the
+    // new shop to that referrer via the atomic superset RPC. A well-formed but
+    // UNKNOWN code (typo, or a code that changed) must NEVER block signup: migration
+    // 028 rejects the code BEFORE creating anything, so we safely fall back to the
+    // legacy path (no attribution) and SAY SO rather than failing silently.
+    const ref = getCapturedReferral();
+    if (ref) {
+      try {
+        await rpcCreateShopWithReferral(name, phone, ref);
+      } catch (err) {
+        if (!isReferralRejection(err)) throw err; // a real failure — surface it, keep the code for retry
+        await rpcCreateShop(name, phone);
+        useUiStore
+          .getState()
+          .push('warn', 'That referral code wasn’t recognised, so your shop was created without it.');
+      }
+    } else {
+      await rpcCreateShop(name, phone);
+    }
+    clearCapturedReferral(); // the shop exists now — the code has served its purpose
     const user = await getLocalUser();
     if (user) {
       const profile = await tryFetchProfile(user.id);
@@ -219,6 +242,18 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
   },
 
   logout: async () => {
+    // SMART WIPE (safety.md): flush the outbox and clear the sensitive local
+    // tables BEFORE we drop the session — the flush needs the live auth token,
+    // and `signOut()` invalidates it. A REFUSED wipe (money data not yet in the
+    // cloud) leaves every local table intact and is surfaced to the cashier; we
+    // never destroy unsynced sales. A wipe failure must never block sign-out.
+    let wipe: Awaited<ReturnType<typeof smartWipeForLogout>> | undefined;
+    try {
+      wipe = await smartWipeForLogout();
+    } catch {
+      // best-effort — fall through to a normal sign-out
+    }
+
     unsubscribeAuth?.();
     set({ user: null });
     writeCachedIdentity(null);
@@ -226,6 +261,17 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
       await signOut();
     } catch {
       // offline sign-out — local state already cleared; server clears on next conn.
+    }
+
+    // The wipe only clears when nothing syncable is left; if it refused, tell
+    // the user plainly rather than leaving sensitive data behind silently.
+    if (wipe && !wipe.wiped) {
+      useUiStore
+        .getState()
+        .push(
+          'warn',
+          `Signed out, but ${wipe.pending} item${wipe.pending === 1 ? '' : 's'} still need to sync — this device was NOT cleared. Reconnect and sign out again to wipe it.`
+        );
     }
   },
 

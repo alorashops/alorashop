@@ -39,6 +39,10 @@ export default defineConfig(({ mode }) => {
           // forever. That's why .wasm/.data are in the globs AND the size cap is
           // raised above the engine's biggest single file.
           globPatterns: ['**/*.{js,css,html,svg,png,woff2,wasm,data}'],
+          // AFFILIATE.md A8: the Affiliate page is ONLINE-ONLY. Keep its lazy
+          // chunk OUT of the precache so the offline shell never carries it and
+          // it is always fetched fresh (offline -> AffiliateBoundary message).
+          globIgnores: ['**/AffiliatePage-*.js'],
           maximumFileSizeToCacheInBytes: 20 * 1024 * 1024,
           runtimeCaching: []
         }
