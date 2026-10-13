@@ -76,6 +76,54 @@ alter default privileges for role supabase_admin in schema public revoke all on 
 Re-check with `scripts/verify_p12c_lockdown_complete_applied.sql` — Section 3
 must then be 0 rows.
 
+### Accepted residual — Supabase linter `security_definer_view` ×2 (P12c-4)
+
+The Supabase **Security Advisor** shows two `ERROR` rows (`security_definer_view`)
+for `public.sales_secure` and `public.daily_summaries_secure`. **This is a static
+false positive, not an exposure — decision: ACCEPTED RESIDUAL** (same class as
+the `supabase_admin` residual above).
+
+**Why the linter fires:** migration 24 made both views `SECURITY DEFINER` *on
+purpose*. A `security_invoker` view would need the reader's own `SELECT` on the
+raw `sales`/`daily_summaries` `data` column — **and that IS the cashier-margin
+leak**. The linter is static: it sees the "definer" property but cannot read the
+tenant predicate inside the view body.
+
+**Why it is safe (measured, not assumed):** both views carry an explicit
+`WHERE shop_id = current_shop_id()`; a NULL shop returns ZERO rows and a NULL
+role redacts the margin — i.e. it **fails closed**.
+`scripts/verify_p12c3_revoke_raw_select.mjs` (21/21) proves a shop sees only its
+own rows, that the predicate is load-bearing (removing it re-opens a cross-shop
+read), and that margin is stripped for cashiers. The only genuinely dangerous
+version — letting `anon` (no sign-in) call these — was closed by migrations
+18/22. Re-test any time with `scripts/verify_exposure_audit.sql` (every section
+must read "clean"). The `authenticated_security_definer_function_executable`
+WARNs in the same Advisor output are the intended RPC surface (`add_staff`,
+`create_shop`, `upsert_sales`, …) and MUST NOT be "fixed" — revoking `EXECUTE` or
+switching to `INVOKER` breaks those features.
+
+> **DO NOT** revert the views to `security_invoker` and **DO NOT** re-grant raw
+> `SELECT` on `sales`/`daily_summaries` to clear the lint — either one **re-opens
+> the cashier-margin leak (P12c-3)**. The lint is not worth a real hole.
+
+**To clear the two ERRORs (optional, cosmetic — no security gain), pick one and
+rehearse it FIRST (`reproduce → fix → mutate`) before applying:**
+
+1. **Design 2 — server-only (recommended).** Keep the views `security_invoker`
+   but source the redacted `data` from a per-row `SECURITY DEFINER` helper
+   (`public.sale_data_masked(id)` / `public.daily_summary_data_masked(id)`), with
+   **column-level** `SELECT (id, shop_id, updated_at)` granted on the raw tables.
+   **No client/front-end change** (same view name + same columns). Cost: a
+   per-row helper call bounded by the page size; adds one `authenticated`-
+   callable definer function (a WARN, same class as the existing RPCs).
+2. **Design 1 — read RPCs.** Replace both views with `SECURITY DEFINER`
+   `pull_*_secure(cursor, from, limit)` RPCs and rewrite `pullCloudChanges`
+   (`src/services/supabaseSync.ts`) to call `.rpc(...)`. Better performance, but
+   it **touches the client sync read path** — higher risk.
+
+Either design must keep the tenant predicate and the margin mask, and be proven
+by a rehearsal before applying (the same rule as every other migration here).
+
 > **The one invariant:** never `CREATE OR REPLACE` or `ALTER … SET search_path` a
 > function whose body is not in this repo (`create_shop`, `update_shop_name`,
 > `current_shop_id`, `current_user_role`, `handle_new_user`, `set_updated_at`).
@@ -133,6 +181,11 @@ verification blocks). The repo also ships executable checks:
 | `node scripts/verify_p12c3_revoke_raw_select.mjs` | 21/21 |
 | `node scripts/verify_p10b_reauth_migration.mjs` | 22/22 |
 | `node scripts/verify_p10a_password_policy.mjs` | 28/28 |
+| `node scripts/verify_affiliate_rls_matrix.mjs` | 48/48 (S10a — whole affiliate privilege matrix) |
+| `node scripts/verify_affiliate_e2e.mjs` | 60/60 (S10b — end-to-end with simulated events) |
+| `node scripts/verify_affiliate_payout_limits.mjs` | 13/13 (S11a — min-payout floor owner read) |
+| `node scripts/verify_lazy_retry.mjs` | 16/16 (S11b — chunk-load one-shot reload) |
+| `node scripts/verify_finalize_transfer_decide.ts` | 18/18 (S11c — OTP finalize logic) |
 | `scripts/verify_p10c_live_reconcile.sql` (SQL editor) | all checks true |
 | `scripts/verify_p14_applied.sql` (SQL editor) | Sections 1 & 2 = 0 rows |
 | `scripts/verify_p13b_applied.sql` (SQL editor) | Sections 1–4 = 0 rows |

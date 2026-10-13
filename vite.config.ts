@@ -42,7 +42,8 @@ export default defineConfig(({ mode }) => {
           // AFFILIATE.md A8: the Affiliate page is ONLINE-ONLY. Keep its lazy
           // chunk OUT of the precache so the offline shell never carries it and
           // it is always fetched fresh (offline -> AffiliateBoundary message).
-          globIgnores: ['**/AffiliatePage-*.js'],
+          // BILLING.md B5: the Billing page follows the SAME rule.
+          globIgnores: ['**/AffiliatePage-*.js', '**/BillingPage-*.js'],
           maximumFileSizeToCacheInBytes: 20 * 1024 * 1024,
           runtimeCaching: []
         }

@@ -11,6 +11,8 @@ import { subscribeLowStock } from './stores/inventoryStore';
 import { Toasts, ConfirmDialog } from './components/overlays';
 import { EmptyState } from './components/ui';
 import { getMyUnreadCount } from './services/affiliate';
+import { getBillingState } from './services/billing';
+import { billingNeedsAttention } from './lib/billing';
 import { lazyRetry } from './lib/lazyRetry';
 import { ReceiptModal } from './components/ReceiptModal';
 import { InstallPromptPopup } from './components/InstallPromptPopup';
@@ -32,6 +34,10 @@ import SettingsPage from './pages/SettingsPage';
 // "needs a connection" card. It is loop-proof (sessionStorage-guarded).
 const AffiliatePage = lazy(lazyRetry(() => import('./pages/AffiliatePage')));
 
+// Billing (S12-6) follows the SAME pattern (B5): its own online-only chunk,
+// excluded from the precache, with a boundary that degrades to a friendly card.
+const BillingPage = lazy(lazyRetry(() => import('./pages/BillingPage')));
+
 /** Catches a failed lazy chunk load (offline) and shows a graceful message. */
 class AffiliateBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   state = { failed: false };
@@ -46,6 +52,28 @@ class AffiliateBoundary extends Component<{ children: ReactNode }, { failed: boo
             icon="🔌"
             title="Affiliate needs a connection"
             hint="This page loads online only. Reconnect, then open Affiliate again."
+          />
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+/** Billing boundary — mirrors AffiliateBoundary (online-only chunk). */
+class BillingBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="card">
+          <EmptyState
+            icon="🔌"
+            title="Billing needs a connection"
+            hint="This page loads online only. Reconnect, then open Billing again."
           />
         </div>
       );
@@ -117,6 +145,49 @@ function Shell() {
     };
   }, [online, shopId]);
 
+  // Billing "needs attention" badge (S12-7). DERIVED from billing.state() with the
+  // pure `billingNeedsAttention` helper — no new table, no migration, no secret.
+  // The Billing page already shows the banner + countdown; this ONLY pulls a
+  // member who is not on that page. Online-only + non-fatal: a failure, or a
+  // session without a shop, simply means no badge (never a broken shell).
+  //
+  // SELF-CLEAR: the shell persists across navigation, so a one-shot load would go
+  // stale after a member pays. We therefore re-check on tab WAKE (focus /
+  // visibilitychange) and on in-app NAVIGATION (hashchange — the router is
+  // hash-based), so the badge clears as soon as the paid state is observed.
+  const [billingAttention, setBillingAttention] = useState(false);
+  useEffect(() => {
+    if (!online || !shopId) return;
+    let cancelled = false;
+    let seq = 0; // last-write-wins: wake + navigation checks can overlap
+    const refresh = () => {
+      const my = ++seq;
+      void (async () => {
+        try {
+          const s = await getBillingState();
+          // Only the LATEST in-flight check may set state, so a slow earlier
+          // response can never overwrite a newer one (a silent-bug defence).
+          if (!cancelled && my === seq) setBillingAttention(billingNeedsAttention(s));
+        } catch {
+          /* non-fatal — no badge */
+        }
+      })();
+    };
+    refresh(); // initial load (mount / reconnect / shop switch)
+    const onWake = () => {
+      if (document.visibilityState === 'visible') refresh();
+    };
+    window.addEventListener('focus', onWake);
+    document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('hashchange', refresh);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', onWake);
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('hashchange', refresh);
+    };
+  }, [online, shopId]);
+
   // No session, or session without a shop yet -> auth/create-shop flow.
   if (!user || !user.shopId) return <Navigate to="/login" replace />;
 
@@ -135,6 +206,7 @@ function Shell() {
           <NavBadge path="/customers" label="Customers" icon="👥" />
           <NavBadge path="/analytics" label="Analytics" icon="📊" />
           <NavBadge path="/affiliate" label="Affiliate" icon="💸" badge={affiliateUnread} />
+          <NavBadge path="/billing" label="Billing" icon="💳" badge={billingAttention ? 1 : 0} />
           <NavBadge path="/settings" label="Settings" icon="⚙️" />
         </nav>
         <div className="foot">
@@ -191,6 +263,16 @@ function Shell() {
                     <AffiliatePage />
                   </Suspense>
                 </AffiliateBoundary>
+              }
+            />
+            <Route
+              path="/billing"
+              element={
+                <BillingBoundary>
+                  <Suspense fallback={<div className="card">Loading Billing…</div>}>
+                    <BillingPage />
+                  </Suspense>
+                </BillingBoundary>
               }
             />
             <Route path="/settings" element={<SettingsPage />} />
