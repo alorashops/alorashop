@@ -324,6 +324,27 @@ export async function pullDelta(): Promise<void> {
   }
 }
 
+/**
+ * Targeted self-heal for ONE table (e.g. `customers`). Pulls that table from
+ * cursor 0 — ignoring the global delta cursor — and applies the rows locally
+ * WITHOUT moving the global watermark (advancing it could skip another table's
+ * newer rows). Combined with the tenant-repair in keepLocalIfNotOlder, this
+ * repairs a device whose local table is empty/drifted even though the cloud has
+ * the rows, so the user never has to erase local data.
+ */
+export async function repairPullTable(tableName: string): Promise<number> {
+  if (!isSupabaseConfigured || !(await isOnline())) return 0;
+  try {
+    const changes = await pullCloudChanges(0, tableName);
+    if (changes.length === 0) return 0;
+    const applied = await applyCloudChanges(changes);
+    await bumpQuota('reads', Math.max(1, changes.length));
+    return applied.length;
+  } catch {
+    return 0; // non-fatal — the caller reloads; the next page/session retries
+  }
+}
+
 /** Apply cloud rows locally; returns only the changes that were actually written. */
 async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[]> {
   const applied: PulledChange[] = [];
@@ -374,10 +395,16 @@ async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[
     const pulledV = versionOf(payload);
     if (localV > pulledV) return true; // local is genuinely newer — keep it
     if (localV === pulledV) {
-      // Same stamp: the cloud copy is interchangeable EXCEPT it can never
-      // carry this device's local-only enrichment (profit backfill). See the
-      // SALE case for the merge. For pure doc tables an equal-stamp cloud row
-      // is a byte-identical no-op — skip the write.
+      // Same stamp: the cloud copy is normally a byte-identical no-op — skip
+      // the write. BUT a local row can be MISSING the tenant key (`shopId`)
+      // that the cloud carries (e.g. a legacy/partially-written row). Every
+      // `where('shopId')` read filters on `data->>'shopId'`, so such a local
+      // row is INVISIBLE, and this equal-stamp skip would let that drift persist
+      // forever — the "Customers page empty until you erase local data" bug.
+      // Repair the tenant key so the corrective write happens instead of a skip.
+      const localShopId = (local as Record<string, unknown>)?.shopId;
+      const pulledShopId = (payload as Record<string, unknown>)?.shopId;
+      if (!localShopId && pulledShopId) return false; // apply the cloud row
       return true;
     }
     return false; // cloud row is newer — apply it

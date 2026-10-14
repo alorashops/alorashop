@@ -271,6 +271,10 @@ const PULL_PAGE_SIZE = 500;
  * Cursor 0 is a fresh device: there is no watermark yet, so we pull the whole
  * shop (gt 0 = every row) once and let the caller stamp the max applied value.
  *
+ * `onlyTable` (optional) restricts the pull to a single table from cursor 0 —
+ * the targeted self-heal path (repairPullTable) that repairs an empty/drifted
+ * table WITHOUT advancing the global watermark.
+ *
  * Pagination: Supabase caps any single query at 1,000 rows, so a shop with
  * more than that on a fresh device used to load in slow 15s-tick chunks (the
  * oldest 1,000, then 1,001–2,000 next tick, …). Each table is now drained
@@ -281,10 +285,12 @@ const PULL_PAGE_SIZE = 500;
  * Termination is guaranteed: a page shorter than PAGE_SIZE (or empty) ends the
  * loop; an empty table costs exactly one request.
  */
-export async function pullCloudChanges(cursor: number): Promise<PulledChange[]> {
+export async function pullCloudChanges(cursor: number, onlyTable?: string): Promise<PulledChange[]> {
   const sb = getClient();
   const changes: PulledChange[] = [];
   for (const t of PULL_TABLES) {
+    // A targeted repair pull (cursor 0) touches ONE table — skip the rest.
+    if (onlyTable && t.table !== onlyTable) continue;
     let from = 0;
     // P6d: SALE/DAILY_SUMMARY read through the masking view (t.via); the rest
     // read their own table. Writes are unaffected (they use `table`, not `via`).

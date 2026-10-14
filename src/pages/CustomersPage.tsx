@@ -8,8 +8,9 @@ import type { CreditLedgerRow } from '../db/repos/customers';
 import { isContactPickerSupported, pickPhoneContact, pickVCardContact } from '../lib/contactPicker';
 import type { ContactPick } from '../lib/contactPicker';
 import { Modal, EmptyState } from '../components/ui';
-import { fmtMoney, fmtDateTime, parseMoneyInput } from '../lib/utils';
+import { fmtMoney, fmtDateTime, parseMoneyInput, isCloudShopId } from '../lib/utils';
 import type { Customer } from '../types';
+import { repairPullTable } from '../services/syncService';
 
 export default function CustomersPage() {
   const user = useAuthStore((s) => s.user);
@@ -24,19 +25,42 @@ export default function CustomersPage() {
   const [ledger, setLedger] = useState<Array<CreditLedgerRow & { running: number }>>([]);
   const nameRef = useRef<HTMLInputElement>(null);
   const phoneRef = useRef<HTMLInputElement>(null);
+  // Guards the targeted customers self-heal so it runs at most once per mount
+  // (never loops on an empty search or while offline).
+  const repairAttempted = useRef(false);
   const [contactBusy, setContactBusy] = useState(false);
   // Android Chrome exposes the native Contacts Picker; everywhere else we fall
   // back to a vCard import (iOS surfaces a "Contacts" section in its picker).
   const nativeContacts = isContactPickerSupported();
 
-  const load = async () => {
-    const rows = await getCustomers(shopIdOf());
-    const q = query.trim().toLowerCase();
-    setCustomers(q ? rows.filter((c) => c.name.toLowerCase().includes(q) || c.phone.includes(q)) : rows);
+  const load = async (opts?: { repair?: boolean }) => {
+    try {
+      const shopId = shopIdOf();
+      const rows = await getCustomers(shopId);
+      const q = query.trim().toLowerCase();
+      setCustomers(q ? rows.filter((c) => c.name.toLowerCase().includes(q) || c.phone.includes(q)) : rows);
+      // SELF-HEAL: a real online shop showing ZERO UNFILTERED customers means the
+      // local customers table is empty/drifted while the cloud has the rows (the
+      // "Customers page empty until you erase local data" bug). Pull the customers
+      // table fresh (cursor 0) once per mount and reload — no user wipe needed.
+      if (opts?.repair && !q && rows.length === 0 && !repairAttempted.current) {
+        repairAttempted.current = true;
+        if (isCloudShopId(shopId)) {
+          await repairPullTable('customers');
+          const rows2 = await getCustomers(shopId);
+          setCustomers(rows2);
+        }
+      }
+    } catch (err) {
+      // Surface the real reason instead of silently showing "No customers"
+      // (an unhandled throw here left the list empty with no clue — a silent bug).
+      console.error('CustomersPage.load failed', err);
+      toast.push('error', `Could not load customers: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   useEffect(() => {
-    void load();
+    void load({ repair: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query]);
 
