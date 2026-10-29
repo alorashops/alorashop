@@ -3,7 +3,7 @@ import { useAuthStore, shopIdOf, canSeeCosting } from '../stores/authStore';
 import { useUiStore } from '../stores/uiStore';
 import { getSummariesRange, getTopSellingRange, backfillProfits, autoBackfillProfit, getStockValue, type TopSellingItem } from '../db/repos/summary';
 import { fmtMoneyCompact, todayKey, pct } from '../lib/utils';
-import { EmptyState } from '../components/ui';
+import { EmptyState, SkeletonCard, SkeletonStats } from '../components/ui';
 import type { DailySummary } from '../types';
 
 /** YYYY-MM-DD for a day offset from today (negative = past). */
@@ -26,9 +26,16 @@ export default function AnalyticsPage() {
   /** Monotonic load id — a slow OLD load must never overwrite a NEWER one
       (the classic stale-response race when Refresh/date-change fire fast). */
   const loadSeq = useRef(0);
+  /** True ONLY until the first read settles — drives the skeletons so a
+      date change / refresh keeps the numbers already on screen. */
+  const [initialLoading, setInitialLoading] = useState(true);
+  /** In-flight indicator for the Refresh button only (never a skeleton). */
+  const [loading, setLoading] = useState(false);
 
   const load = async (from = fromDate, to = toDate) => {
     const seq = ++loadSeq.current;
+    setLoading(true);
+    try {
     // AUTO-PROFIT (Problem #4): before aggregating, gap-fill profit onto any
     // profit-less sales in the viewed range so cashier sales (the common 80%)
     // show profit with zero clicks. Reads the LIVE role from the store so a
@@ -52,6 +59,16 @@ export default function AnalyticsPage() {
     setSummaries(sum);
     setTopSelling(top);
     setStockValue(sv);
+    } catch (err) {
+      // A stale failure belongs to a superseded request — do not toast it.
+      if (seq !== loadSeq.current) return;
+      toast.push('error', err instanceof Error ? err.message : String(err));
+    } finally {
+      if (seq === loadSeq.current) {
+        setLoading(false);
+        setInitialLoading(false);
+      }
+    }
   };
 
   useEffect(() => {
@@ -104,7 +121,9 @@ export default function AnalyticsPage() {
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-secondary" onClick={() => void load()}>↻ Refresh</button>
+          <button className="btn btn-secondary" onClick={() => void load()} disabled={loading}>
+            {loading ? 'Loading…' : '↻ Refresh'}
+          </button>
           {seeProfit && (
             <button className="btn btn-primary" onClick={() => void doBackfill()} disabled={backfilling}>
               {backfilling ? 'Recomputing…' : 'Recompute profit'}
@@ -125,6 +144,9 @@ export default function AnalyticsPage() {
         <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>{dayCount} day{dayCount === 1 ? '' : 's'}</span>
       </div>
 
+      {initialLoading ? (
+        <SkeletonStats count={seeProfit ? 4 : 3} className="grid cols-4" />
+      ) : (
       <div className="grid cols-4" style={{ marginBottom: 16 }}>
         <div className="card stat">
           <div className="label">Sales</div>
@@ -153,12 +175,14 @@ export default function AnalyticsPage() {
           <div className="sub">{seeProfit ? `${fmtMoneyCompact(stockValue.value)} value (WAC)` : 'units'}</div>
         </div>
       </div>
+      )}
 
       {/* Top sellers first, each card on its OWN full-width row. On narrow
           (phone) screens a side-by-side layout crushed the revenue bars and
           could hide the top-sellers card entirely — stacked rows keep every
           card visible at any width. */}
       <div className="grid" style={{ marginBottom: 16 }}>
+      {initialLoading ? <SkeletonCard lines={6} /> : (<>
         <div className="card">
           <div style={{ fontWeight: 800, marginBottom: 12 }}>Top selling products</div>
           {topSelling.length === 0 ? (
@@ -236,6 +260,7 @@ export default function AnalyticsPage() {
             </div>
           )}
         </div>
+      </>)}
       </div>
 
       {seeProfit && (

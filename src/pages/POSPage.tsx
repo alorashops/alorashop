@@ -11,6 +11,7 @@ import { chargeCardOrPaystack } from '../services/paystack';
 import { verifyPayment } from '../services/paystackVerify';
 import { flushOutbox } from '../services/syncService';
 import { fmtMoney } from '../lib/utils';
+import { SkeletonTiles } from '../components/ui';
 import type { Customer, PaymentMethod, PaymentStatus, Sale } from '../types';
 
 export default function POSPage() {
@@ -42,6 +43,9 @@ export default function POSPage() {
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | undefined>();
   /** Two-stage checkout — step 1 picks items full-width, step 2 handles payment full-width. */
   const [stage, setStage] = useState<'items' | 'pay'>('items');
+  /** True ONLY until the first catalogue read settles — the tile grid
+      shimmers instead of flashing "No products match" during boot. */
+  const [initialLoading, setInitialLoading] = useState(true);
 
   const subtotal = cartSubtotal(cart.lines);
   const total = cartTotal(cart.lines, cart.discount);
@@ -65,6 +69,25 @@ export default function POSPage() {
   const remaining = Math.max(0, amountLeft - storedCredit - cardCoverage - paystackCoverage);
   const itemCount = cart.lines.reduce((n, l) => n + l.quantity, 0);
   const cartHasItems = cart.lines.some((l) => l.quantity > 0);
+
+  // First-load gate: the shell can mount POS while the boot refresh is still in
+  // flight. Read once here so the grid shimmers, and ALWAYS clear the flag.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        await refresh();
+      } catch (err) {
+        toast.push('error', err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) setInitialLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refresh]);
 
   // Global scanner wedge — no input focus needed.
   useEffect(() => {
@@ -448,6 +471,9 @@ export default function POSPage() {
               ))}
             </select>
           </div>
+          {initialLoading ? (
+            <SkeletonTiles count={8} />
+          ) : (
           <div className="product-grid">
             {visible.map((p) => {
               const low = p.stockQuantity <= p.minStockLevel;
@@ -478,6 +504,7 @@ export default function POSPage() {
             })}
             {visible.length === 0 && <div style={{ color: 'var(--text-muted)', padding: 30 }}>No products match.</div>}
           </div>
+          )}
         </div>
 
         {/* step-1 footer: cart summary + gateway to payment */}

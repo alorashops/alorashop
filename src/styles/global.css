@@ -129,6 +129,30 @@ input, select { font-family: inherit; }
 .stat .label { font-size: 12px; color: var(--text-muted); font-weight: 600; }
 .stat .value { font-size: 24px; font-weight: 800; margin-top: 4px; }
 .stat .sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+/* ---------- loading skeletons (S14) ---------- */
+/* Base shimmer block. The colour comes from an existing token so a skeleton
+   reads correctly both on the page background and inside a white .card. */
+.skeleton {
+  background: var(--border);
+  position: relative;
+  overflow: hidden;
+}
+/* The sweep is a pseudo-element so it can be switched off for reduced-motion
+   users without changing the placeholder's size or shape. */
+.skeleton-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(148, 163, 184, 0.28), transparent);
+  animation: skeleton-sweep 1.3s ease-in-out infinite;
+}
+@keyframes skeleton-sweep {
+  100% { transform: translateX(100%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-shimmer::after { animation: none; }
+}
 
 /* ---------- buttons ---------- */
 .btn {

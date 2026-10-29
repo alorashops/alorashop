@@ -7,7 +7,7 @@ import { getCustomers, createCustomer, findByPhone, payCredit, getCreditLedgerDe
 import type { CreditLedgerRow } from '../db/repos/customers';
 import { isContactPickerSupported, pickPhoneContact, pickVCardContact } from '../lib/contactPicker';
 import type { ContactPick } from '../lib/contactPicker';
-import { Modal, EmptyState } from '../components/ui';
+import { Modal, EmptyState, SkeletonTable } from '../components/ui';
 import { fmtMoney, fmtDateTime, parseMoneyInput, isCloudShopId } from '../lib/utils';
 import type { Customer } from '../types';
 import { repairPullTable } from '../services/syncService';
@@ -17,6 +17,9 @@ export default function CustomersPage() {
   const toast = useUiStore();
   const navigate = useNavigate();
   const [customers, setCustomers] = useState<Customer[]>([]);
+  /** True ONLY until the first read settles — a query re-read or a refresh
+      keeps the rows already on screen instead of flashing a skeleton. */
+  const [initialLoading, setInitialLoading] = useState(true);
   const [query, setQuery] = useState('');
   const [addOpen, setAddOpen] = useState(false);
   const [payFor, setPayFor] = useState<Customer | null>(null);
@@ -56,6 +59,8 @@ export default function CustomersPage() {
       // (an unhandled throw here left the list empty with no clue — a silent bug).
       console.error('CustomersPage.load failed', err);
       toast.push('error', `Could not load customers: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setInitialLoading(false);
     }
   };
 
@@ -218,7 +223,11 @@ export default function CustomersPage() {
         />
       </div>
 
-      {customers.length === 0 ? (
+      {initialLoading ? (
+        /* First paint only: the table region shimmers, the title + search +
+           New Customer stay live. Later re-reads keep the rows on screen. */
+        <SkeletonTable rows={8} cols={5} />
+      ) : customers.length === 0 ? (
         <div className="card"><EmptyState icon="👥" title="No customers" hint="Add a customer to start store-credit tabs." /></div>
       ) : (
         <div className="card" style={{ padding: 0, overflow: 'auto' }}>

@@ -3,7 +3,7 @@ import { useAuthStore, shopIdOf, canManageInventory, canSeeCosting } from '../st
 import { useInventoryStore } from '../stores/inventoryStore';
 import { useUiStore } from '../stores/uiStore';
 import { createProduct, updateProduct, restockProduct, deleteProduct } from '../db/repos/products';
-import { Modal, EmptyState } from '../components/ui';
+import { Modal, EmptyState, SkeletonTable } from '../components/ui';
 import { fmtMoney, parseMoneyInput } from '../lib/utils';
 import type { Product } from '../types';
 
@@ -33,12 +33,29 @@ export default function InventoryPage() {
   /** Optional purchase unit cost for a restock — drives the weighted-average
       cost (WAC) update. Blank = keep the current cost basis. */
   const [restockCost, setRestockCost] = useState('');
+  /** True ONLY until the first refresh settles — the table shimmers instead
+      of flashing "No products" while the first local read runs. */
+  const [initialLoading, setInitialLoading] = useState(true);
 
   const manage = canManageInventory(user?.role);
   const seeCost = canSeeCosting(user?.role);
 
   useEffect(() => {
-    void refresh().then(() => (seeCost ? loadCosting() : undefined));
+    let cancelled = false;
+    void (async () => {
+      try {
+        await refresh();
+        if (seeCost) await loadCosting();
+      } catch (err) {
+        toast.push('error', err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) setInitialLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refresh, loadCosting, seeCost]);
 
   /** Reload products AND costing after any mutation — fixes cost/margin showing
@@ -173,7 +190,11 @@ export default function InventoryPage() {
         )}
       </div>
 
-      {visible.length === 0 ? (
+      {initialLoading ? (
+        /* First paint only: the table shimmers, the title + filters stay live.
+           A later refresh (sync or manual) keeps the rows on screen. */
+        <SkeletonTable rows={8} cols={seeCost ? (manage ? 10 : 9) : (manage ? 8 : 7)} />
+      ) : visible.length === 0 ? (
         <div className="card"><EmptyState title="No products" hint="Add your first product or adjust filters." /></div>
       ) : (
         <div className="card" style={{ padding: 0, overflow: 'auto' }}>

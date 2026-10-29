@@ -61,22 +61,91 @@ let pglite: PGlite | null = null;
 let schemaReady = false;
 let activeTx: PGliteTransaction | null = null;
 
+// ---------------------------------------------------------------------------
+// BOOT STATUS (S13) — the local engine is a ~17 MB side-loaded download on a
+// cold device (pglite.wasm 10 MB + pglite.data 6.3 MB + initdb.wasm), so the UI
+// must be able to ASK "is the local database usable yet?" instead of parking the
+// whole app on a splash while it arrives. Nothing in the auth path needs it;
+// only the data screens do (see App.tsx: the shell waits, /login never does).
+// ---------------------------------------------------------------------------
+export type DbStatus = 'idle' | 'booting' | 'ready' | 'failed';
+
+let dbStatus: DbStatus = 'idle';
+let dbError: string | null = null;
+const dbListeners = new Set<(status: DbStatus, error: string | null) => void>();
+
+function setDbStatus(next: DbStatus, error: string | null = null): void {
+  dbStatus = next;
+  dbError = error;
+  for (const cb of dbListeners) cb(next, error);
+}
+
+/** Current local-database boot status. */
+export function getDbStatus(): DbStatus {
+  return dbStatus;
+}
+
+/** The message from the last failed boot attempt, or null. */
+export function getDbError(): string | null {
+  return dbError;
+}
+
+/** Subscribe to boot-status changes. Returns an unsubscribe function. */
+export function subscribeDbStatus(cb: (status: DbStatus, error: string | null) => void): () => void {
+  dbListeners.add(cb);
+  return () => {
+    dbListeners.delete(cb);
+  };
+}
+
+/**
+ * The in-flight boot attempt, SHARED so N concurrent callers (POS and Inventory
+ * both refresh on mount) trigger ONE engine download instead of racing.
+ *
+ * It is reset on failure so a retry can genuinely start over. The old code left
+ * a half-constructed PGlite assigned when `waitReady` rejected, so every later
+ * query hit a dead instance and failed forever — with nothing shown to the user.
+ */
+let bootPromise: Promise<PGlite> | null = null;
+
+function boot(): Promise<PGlite> {
+  if (!bootPromise) {
+    setDbStatus('booting');
+    bootPromise = (async () => {
+      const inst = new PGlite('idb://alorashop');
+      await inst.waitReady;
+      pglite = inst;
+      return inst;
+    })().catch((err: unknown) => {
+      bootPromise = null; // a retry must be able to start a fresh attempt
+      pglite = null;
+      setDbStatus('failed', err instanceof Error ? err.message : 'The local database failed to start');
+      throw err;
+    });
+  }
+  return bootPromise;
+}
+
 /** Lazily open embedded Postgres and create tables once. */
 async function conn(): Promise<PGlite> {
-  if (!pglite) {
-    pglite = new PGlite('idb://alorashop');
-    await pglite.waitReady;
-  }
+  const inst = pglite ?? (await boot());
   if (!schemaReady) {
-    for (const name of Object.keys(TABLE_KEYS)) {
-      await pglite.exec(
-        `CREATE TABLE IF NOT EXISTS ${name} (` +
-          `id TEXT PRIMARY KEY, shop_id TEXT, updated_at BIGINT, data JSONB);`
-      );
+    try {
+      for (const name of Object.keys(TABLE_KEYS)) {
+        await inst.exec(
+          `CREATE TABLE IF NOT EXISTS ${name} (` +
+            `id TEXT PRIMARY KEY, shop_id TEXT, updated_at BIGINT, data JSONB);`
+        );
+      }
+      schemaReady = true;
+      setDbStatus('ready');
+    } catch (err: unknown) {
+      // Leave schemaReady false so a retry re-runs the (idempotent) DDL.
+      setDbStatus('failed', err instanceof Error ? err.message : 'The local database schema failed');
+      throw err;
     }
-    schemaReady = true;
   }
-  return pglite;
+  return inst;
 }
 
 /** Active transaction when present, else the base connection. */

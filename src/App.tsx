@@ -4,12 +4,14 @@ import { useAuthStore, shopIdOf } from './stores/authStore';
 import { useSyncStore } from './stores/syncStore';
 import { useInventoryStore } from './stores/inventoryStore';
 import { useShopStore } from './stores/shopStore';
+import { useUiStore } from './stores/uiStore';
+import { getDbStatus, getDbError, subscribeDbStatus, type DbStatus } from './db';
 
 import { seedIfEmpty, purgeDemoData } from './services/seedService';
 import { startSyncLoop } from './services/syncService';
 import { subscribeLowStock } from './stores/inventoryStore';
 import { Toasts, ConfirmDialog } from './components/overlays';
-import { EmptyState } from './components/ui';
+import { EmptyState, Skeleton, SkeletonStats, SkeletonTable } from './components/ui';
 import { getMyUnreadCount } from './services/affiliate';
 import { getBillingState } from './services/billing';
 import { billingNeedsAttention } from './lib/billing';
@@ -82,6 +84,72 @@ class BillingBoundary extends Component<{ children: ReactNode }, { failed: boole
   }
 }
 
+/**
+ * S13 — Local-database boot state as React state. The engine is a ~17 MB
+ * side-loaded download on a cold device, so the shell can show progress while it
+ * arrives — and, crucially, a REAL error card with a retry if it can never
+ * start (a failed boot used to leave the app parked on a splash forever, with
+ * nothing shown to the user).
+ */
+function useDbStatus(): { status: DbStatus; error: string | null } {
+  const read = () => ({ status: getDbStatus(), error: getDbError() });
+  const [state, setState] = useState(read);
+  useEffect(() => {
+    // Re-read on subscribe as well as on change: a status flip that lands
+    // between the initial render and this subscription (React StrictMode
+    // remounts the shell) would otherwise strand it on the splash forever.
+    setState(read());
+    return subscribeDbStatus(() => setState(read()));
+  }, []);
+  return state;
+}
+
+/** Shell-shaped boot placeholder — shown while the local engine starts.
+ *
+ * S14: this used to be a BLANK full-screen splash, which read as a frozen app.
+ * The real sidebar and topbar now render immediately and only the DATA REGION
+ * shimmers, so a cold device sees the app shape from its first frame.
+ * Same accessibility contract as the other skeletons: the container announces
+ * the wait once (role="status"), the shimmer bars are decorative.
+ */
+function BootSkeleton({ label }: { label: string }) {
+  return (
+    <div className="page" role="status" aria-label={label}>
+      <Skeleton width={220} height={26} />
+      <div style={{ marginTop: 10 }}>
+        <Skeleton width="58%" height={12} />
+      </div>
+      <div style={{ marginTop: 18 }}>
+        <SkeletonStats count={4} />
+      </div>
+      <div style={{ marginTop: 18 }}>
+        <SkeletonTable rows={6} cols={6} />
+      </div>
+    </div>
+  );
+}
+
+/** The local engine could not start — say so and offer a retry (never a hang). */
+function BootFailure({ error, onRetry }: { error: string | null; onRetry: () => void }) {
+  return (
+    <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg)', padding: 20 }}>
+      <div className="card" style={{ maxWidth: 460, textAlign: 'center' }}>
+        <EmptyState
+          icon="⚠️"
+          title="Your offline data could not start"
+          hint={error ?? 'The local database engine failed to load.'}
+        />
+        <button className="btn" onClick={onRetry} style={{ padding: '12px 18px', fontWeight: 800 }}>
+          Try again
+        </button>
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10 }}>
+          The first launch downloads the offline engine once — check your connection, then try again.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NavBadge({ path, label, icon, badge }: { path: string; label: string; icon: string; badge?: number }) {
   return (
     <NavLink to={path} className={({ isActive }) => (isActive ? 'active' : '')}>
@@ -101,6 +169,13 @@ function Shell() {
   const lastError = useSyncStore((s) => s.lastError);
   const lowStock = useInventoryStore((s) => s.lowStock.length);
   const shopName = useShopStore((s) => s.name);
+
+  // S13: local-database boot state. The data screens read PGlite, so the shell
+  // waits for the engine — while the AUTH routes never do (see the gate below).
+  const db = useDbStatus();
+  /** Used by the retry button on the boot-failure card. */
+  const syncRefresh = useSyncStore((s) => s.refresh);
+  const inventoryRefresh = useInventoryStore((s) => s.refresh);
 
   // Sidebar drawer — toggleable via the ☰ button in the topbar.
   // Open by default on wide screens; on small screens the sidebar is hidden
@@ -191,6 +266,23 @@ function Shell() {
   // No session, or session without a shop yet -> auth/create-shop flow.
   if (!user || !user.shopId) return <Navigate to="/login" replace />;
 
+  // S13: the data screens read the LOCAL database, so they must not mount until
+  // its engine is up — otherwise POS would show an empty catalogue ("no items
+  // yet") for the seconds the ~17 MB engine takes to arrive, which reads as lost
+  // data. The auth routes above never reach this point, so sign-up stays instant.
+  // A failed boot shows a retry card instead of hanging silently.
+  if (db.status === 'failed') {
+    return (
+      <BootFailure
+        error={db.error}
+        onRetry={() => {
+          void syncRefresh();
+          void inventoryRefresh();
+        }}
+      />
+    );
+  }
+
   return (
     <div className={`app-shell${sidebarOpen ? ' sidebar-open' : ' sidebar-closed'}`}>
       {sidebarOpen && <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />}
@@ -200,13 +292,13 @@ function Shell() {
           <span className="brand-name">{shopName}</span>
         </div>
         <nav className="nav" onClick={handleNavClick}>
-          <NavBadge path="/pos" label="Checkout" icon="🛒" />
-          <NavBadge path="/inventory" label="Inventory" icon="📦" badge={lowStock} />
+          <NavBadge path="/pos" label="Sell Item" icon="🛒" />
+          <NavBadge path="/inventory" label="Add Items" icon="📦" badge={lowStock} />
           <NavBadge path="/sales" label="Sales" icon="🧾" />
           <NavBadge path="/customers" label="Customers" icon="👥" />
           <NavBadge path="/analytics" label="Analytics" icon="📊" />
-          <NavBadge path="/affiliate" label="Affiliate" icon="💸" badge={affiliateUnread} />
-          <NavBadge path="/billing" label="Billing" icon="💳" badge={billingAttention ? 1 : 0} />
+          <NavBadge path="/affiliate" label="Earn" icon="💸" badge={affiliateUnread} />
+          <NavBadge path="/billing" label="Payment" icon="💳" badge={billingAttention ? 1 : 0} />
           <NavBadge path="/settings" label="Settings" icon="⚙️" />
         </nav>
         <div className="foot">
@@ -249,6 +341,9 @@ function Shell() {
           </div>
         </div>
         <main className="main">
+          {db.status !== 'ready' ? (
+            <BootSkeleton label="Preparing your offline shop data…" />
+          ) : (
           <Routes>
             <Route path="/pos" element={<POSPage />} />
             <Route path="/inventory" element={<InventoryPage />} />
@@ -278,6 +373,7 @@ function Shell() {
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/pos" replace />} />
           </Routes>
+          )}
         </main>
       </div>
       {/* Post-login install nudge — only when signed in and not already
@@ -288,52 +384,67 @@ function Shell() {
 }
 
 export default function App() {
-  const [booted, setBooted] = useState(false);
-  const initialize = useAuthStore((s) => s.initialize);
+  const shopId = useAuthStore((s) => s.user?.shopId);
   const refresh = useSyncStore((s) => s.refresh);
   const inventoryRefresh = useInventoryStore((s) => s.refresh);
+  const toast = useUiStore((s) => s.push);
+  const isDev = import.meta.env.DEV;
 
+  // S13 — BACKGROUND BOOT (fire-and-forget).
+  //
+  // This used to gate the WHOLE app — /login and create-shop included — behind
+  // `initialize() + refresh() + inventoryRefresh()`, so the FIRST PAINT waited
+  // for the ~17 MB PGlite engine to download. The result was a frozen splash and
+  // a sign-up page that could not appear until a database it never uses had
+  // arrived. Now:
+  //   - a brand-new visitor gets the sign-up / create-shop UI immediately and
+  //     downloads no engine at all until a shop exists;
+  //   - once a shop is known the engine loads in the background, and because the
+  //     service worker has already precached it (main.tsx) that fetch is served
+  //     from the cache instead of being downloaded a second time;
+  //   - a failure is SURFACED (toast here + the Shell's retry card) instead of
+  //     silently parking the app on the splash forever.
+  //
+  // The session itself is restored pre-paint by main.tsx (zero network), so this
+  // effect never has to wait on auth.
+  //
+  // DEV keeps the old offline-demo behaviour — seed when signed out, purge
+  // leftovers when signed in — because localhost pays no network cost for it.
   useEffect(() => {
+    // PROD: nothing to boot until there is a shop. Demo data and a real shop are
+    // MUTUALLY EXCLUSIVE: a real session purges offline-demo leftovers and never
+    // seeds; no session seeds the offline demo shell once and never a real shop.
+    if (!shopId && !isDev) return;
+
+    let cancelled = false;
     let stopSync: (() => void) | undefined;
     let stopLowStock: (() => void) | undefined;
 
     void (async () => {
-      // Local-first bootstrap: restore the real Supabase session first.
-      // Demo data and a real shop are MUTUALLY EXCLUSIVE:
-      //  - Real session  -> purge any offline-demo leftovers (old bug), never seed.
-      //  - No session    -> seed the offline demo shell (once), never a real shop.
-      await initialize();
-      if (import.meta.env.DEV) {
-        const who = useAuthStore.getState().user;
-        if (who?.shopId) {
-          await purgeDemoData();
-        } else if (!who) {
-          await seedIfEmpty();
+      try {
+        if (isDev) {
+          if (shopId) await purgeDemoData();
+          else await seedIfEmpty();
         }
+        await Promise.all([refresh(), inventoryRefresh()]);
+        if (cancelled) return;
+        stopSync = startSyncLoop();
+        stopLowStock = subscribeLowStock(() => void inventoryRefresh());
+      } catch (err) {
+        // Never swallow it: the Shell also shows a retry card for the same state.
+        toast(
+          'error',
+          `Your offline data could not start${err instanceof Error ? ` — ${err.message}` : ''}`
+        );
       }
-      await Promise.all([refresh(), inventoryRefresh()]);
-      stopSync = startSyncLoop();
-      stopLowStock = subscribeLowStock(() => void inventoryRefresh());
-      setBooted(true);
     })();
 
     return () => {
+      cancelled = true;
       stopSync?.();
       stopLowStock?.();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  if (!booted) {
-    return (
-      <div style={{ height: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg)' }}>
-        <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 40, fontWeight: 800, color: 'var(--primary)' }}>AloraShop</div>
-          <div style={{ color: 'var(--text-muted)', marginTop: 8 }}>Loading local database…</div>
-        </div>
-      </div>
-    );
-  }
+  }, [shopId, isDev, refresh, inventoryRefresh, toast]);
 
   return (
     <HashRouter>

@@ -4,7 +4,7 @@ import { useUiStore } from '../stores/uiStore';
 import { getSalesPage, voidSale } from '../db/repos/sales';
 import { digitalReceipt, shareReceipt } from '../services/printService';
 import { fmtMoney, fmtDateTime } from '../lib/utils';
-import { EmptyState, MethodTag, StatusTag } from '../components/ui';
+import { EmptyState, MethodTag, SkeletonTable, StatusTag } from '../components/ui';
 import type { Sale } from '../types';
 
 const PAGE_SIZE = 25;
@@ -16,22 +16,32 @@ export default function SalesPage() {
   const [cursor, setCursor] = useState<number | undefined>();
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
+  /** True ONLY until the first read settles — drives the skeleton, so a
+      manual refresh keeps the rows already on screen (no blink, no jump). */
+  const [initialLoading, setInitialLoading] = useState(true);
   const canVoid = canManageInventory(user?.role); // manager/admin approve voids
 
   const load = async (nextCursor?: number) => {
     setLoading(true);
-    const rows = await getSalesPage(shopIdOf(), nextCursor, PAGE_SIZE);
-    if (nextCursor === undefined) {
-      setSales(rows);
-    } else {
-      setSales((prev) => {
-        const seen = new Set(prev.map((s) => s.id));
-        return [...prev, ...rows.filter((r) => !seen.has(r.id))];
-      });
+    try {
+      const rows = await getSalesPage(shopIdOf(), nextCursor, PAGE_SIZE);
+      if (nextCursor === undefined) {
+        setSales(rows);
+      } else {
+        setSales((prev) => {
+          const seen = new Set(prev.map((s) => s.id));
+          return [...prev, ...rows.filter((r) => !seen.has(r.id))];
+        });
+      }
+      setCursor(rows.length > 0 ? rows[rows.length - 1].createdAt : nextCursor);
+      setHasMore(rows.length === PAGE_SIZE);
+    } catch (err) {
+      // A rejected read must never leave the screen parked on "Loading…".
+      toast.push('error', err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+      setInitialLoading(false);
     }
-    setCursor(rows.length > 0 ? rows[rows.length - 1].createdAt : nextCursor);
-    setHasMore(rows.length === PAGE_SIZE);
-    setLoading(false);
   };
 
   useEffect(() => {
@@ -70,7 +80,11 @@ export default function SalesPage() {
         {loading ? 'Loading…' : '↻ Refresh'}
       </button>
 
-      {sales.length === 0 && !loading ? (
+      {initialLoading ? (
+        /* First paint only: the data region shimmers, the header + Refresh
+           stay live. A later refresh keeps the table on screen. */
+        <SkeletonTable rows={8} cols={8} />
+      ) : sales.length === 0 ? (
         <div className="card"><EmptyState icon="🧾" title="No sales yet" hint="Complete a sale on the Checkout page — it lands here instantly." /></div>
       ) : (
         <div className="card" style={{ padding: 0, overflow: 'auto' }}>
@@ -118,8 +132,8 @@ export default function SalesPage() {
       )}
 
       {hasMore && (
-        <button className="btn btn-secondary btn-block" onClick={() => void load(cursor)} style={{ marginTop: 12 }}>
-          Load more
+        <button className="btn btn-secondary btn-block" onClick={() => void load(cursor)} style={{ marginTop: 12 }} disabled={loading}>
+          {loading ? 'Loading…' : 'Load more'}
         </button>
       )}
     </div>

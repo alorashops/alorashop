@@ -8,7 +8,7 @@ import { clearLocalData } from '../services/seedService';
 import { flushOutbox } from '../services/syncService';
 import { purgeLocalOnlyOutbox } from '../db/repos/outbox';
 import { addStaff, resetStaffPassword } from '../services/supabase';
-import { Modal } from '../components/ui';
+import { Modal, SkeletonTable } from '../components/ui';
 import { isSupabaseConfigured } from '../config/env';
 import { useInstallPrompt } from '../hooks/useInstallPrompt';
 import { isStrongPassword, PASSWORD_POLICY_MESSAGE } from '../lib/utils';
@@ -56,6 +56,9 @@ export default function SettingsPage() {
   const canManage = canManageStaff(user?.role);
   const isAdmin = canAddManager(user?.role);
   const [staff, setStaff] = useState<UserProfile[]>([]);
+  /** True ONLY until the first staff read settles — the table shimmers
+      instead of showing an empty staff list (which reads as "no accounts"). */
+  const [staffLoading, setStaffLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
     // Add-staff modal
     const [staffModalOpen, setStaffModalOpen] = useState(false);
@@ -108,7 +111,15 @@ export default function SettingsPage() {
   };
 
   const loadStaff = () => {
-    void db.users.toArray().then(setStaff);
+    // A rejected read used to be an unhandled rejection with an empty table and
+    // no clue. Surface it and ALWAYS clear the loading flag.
+    void db.users
+      .toArray()
+      .then(setStaff)
+      .catch((err) => {
+        toast.push('error', errMsg(err));
+      })
+      .finally(() => setStaffLoading(false));
   };
 
   useEffect(() => {
@@ -397,6 +408,9 @@ export default function SettingsPage() {
               + Add staff
             </button>
           </div>
+          {staffLoading ? (
+            <SkeletonTable rows={3} cols={isAdmin ? 4 : 3} />
+          ) : (
                     <table className="table">
                       <thead><tr><th>Name</th><th>Role</th><th>Shop</th>{isAdmin && <th></th>}</tr></thead>
             <tbody>
@@ -421,6 +435,7 @@ export default function SettingsPage() {
               ))}
             </tbody>
           </table>
+          )}
           <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
             {isAdmin
               ? 'Admins can add managers and cashiers, and reset any staff password — no email needed, just share the new password in person. Roles enforce via Supabase RLS + auth claims, never the client.'

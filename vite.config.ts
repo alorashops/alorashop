@@ -69,8 +69,9 @@ export default defineConfig(({ mode }) => {
       exclude: ['@electric-sql/pglite']
     },
     build: {
-      // es2022: top-level await (used by vite-plugin-pwa's register module) is
-      // unsupported in es2020. All modern browsers handle TLA fine.
+      // es2022 for modern browsers. (The original reason was vite-plugin-pwa's
+      // register module using top-level await; S13 removed that await from
+      // main.tsx, so this target is now simply our baseline, not a requirement.)
       target: 'es2022',
       sourcemap: false
     }
