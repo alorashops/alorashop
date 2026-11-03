@@ -59,6 +59,11 @@ function createBarcodeService(): BarcodeService {
     lastKeyTime = now;
 
     if (TERMINATORS.includes(e.key)) {
+      // B4: only swallow Enter/Tab when it actually TERMINATES a scanner burst. A bare
+      // Enter pressed outside any field (e.g. activating a focused-looking button) must
+      // not be eaten while the POS is mounted — with an empty buffer there is nothing to
+      // flush, so let the key through.
+      if (buffer.length === 0) return;
       e.preventDefault();
       flush();
       return;
@@ -87,30 +92,68 @@ function createBarcodeService(): BarcodeService {
 
 export const barcodeService = createBarcodeService();
 
+/** Outcome of an add-to-cart attempt — callers may surface `max-stock`/`out-of-stock`. */
+export type AddToCartStatus = 'added' | 'max-stock' | 'out-of-stock';
+
+export interface AddToCartResult {
+  status: AddToCartStatus;
+  /** Quantity in the cart for this product AFTER the attempt. */
+  quantity: number;
+  /** The product's available stock (the clamp ceiling). */
+  stockAvailable: number;
+}
+
+/**
+ * THE single "a scanned/tapped product becomes a cart line" function (`STEPS.md` S3.1).
+ *
+ * The hardware wedge, the camera scanner and the product tile all funnel through here, so
+ * there is ONE clamp rule and ONE set of toasts — a scan is only ever a new way to call this.
+ *
+ * It also fixes **B3**: `cart.add` clamps at `stockAvailable` with no feedback, so the 4th
+ * scan of a 3-stock item used to do nothing and say nothing (the cashier only noticed at
+ * payment). Now the clamp is announced, and the return value lets a caller add its own
+ * confirmation (e.g. the camera path naming the item, `D4`).
+ */
+export function addProductToCart(product: Product): AddToCartResult {
+  const cart = useCartStore.getState();
+  const toast = useUiStore.getState();
+
+  if (product.stockQuantity <= 0) {
+    toast.push('error', `${product.name} is out of stock`);
+    return { status: 'out-of-stock', quantity: 0, stockAvailable: 0 };
+  }
+
+  const existing = cart.lines.find((l) => l.productId === product.id);
+  const before = existing?.quantity ?? 0;
+
+  // At or past the stock ceiling the add is a no-op — SAY SO instead of silence (B3).
+  if (before >= product.stockQuantity) {
+    toast.push('warn', `Only ${product.stockQuantity} in stock — ${product.name} is already at the limit`);
+    return { status: 'max-stock', quantity: before, stockAvailable: product.stockQuantity };
+  }
+
+  cart.add({
+    productId: product.id,
+    sku: product.sku,
+    name: product.name,
+    unitPrice: product.sellingPrice,
+    quantity: 1,
+    stockAvailable: product.stockQuantity
+  });
+  return { status: 'added', quantity: before + 1, stockAvailable: product.stockQuantity };
+}
+
 /**
  * Convenience: attach a scan handler that looks up the product and adds it to
- * the cart, with a low-stock guard and instant toast feedback.
+ * the cart through {@link addProductToCart} (same path as the camera + tile).
  */
 export function attachProductScanHandler(lookup: (code: string) => Promise<Product | undefined>): () => void {
   return barcodeService.start(async (code) => {
     const product = await lookup(code);
-    const cart = useCartStore.getState();
-    const toast = useUiStore.getState();
     if (!product) {
-      toast.push('warn', `No product for code ${code}`);
+      useUiStore.getState().push('warn', `No product for code ${code}`);
       return;
     }
-    if (product.stockQuantity <= 0) {
-      toast.push('error', `${product.name} is out of stock`);
-      return;
-    }
-    cart.add({
-      productId: product.id,
-      sku: product.sku,
-      name: product.name,
-      unitPrice: product.sellingPrice,
-      quantity: 1,
-      stockAvailable: product.stockQuantity
-    });
+    addProductToCart(product);
   });
 }

@@ -2,6 +2,7 @@ import { db } from '../db';
 import { uid } from '../../lib/utils';
 import { enqueueStockLedger } from './outbox';
 import { applyWeightedAverageCost } from './summary';
+import { isValidSku, nextSkuFrom, normalizeSku, duplicateSkuMessage, MISSING_SKU_MESSAGE } from '../../lib/sku';
 import type { Product, ProductCosting } from '../../types';
 
 /**
@@ -18,14 +19,61 @@ export async function getAllProducts(shopId: string): Promise<Product[]> {
     .toArray();
 }
 
+/**
+ * Resolve a scanned / typed code to a product in THIS shop.
+ *
+ * Match order: exact `sku` → exact `id` → case-insensitive `sku`.
+ *
+ * Two fixes over the previous version, both silent-bug shaped (see STEPS.md §7):
+ *  1. The candidate is now chosen **shop-scoped**. The old code asked the table-wide
+ *     `sku` index for `.first()` and only THEN checked `shopId`, so a same-SKU row
+ *     belonging to another shop could shadow this shop's real product and answer
+ *     "No product for code …" for an item we actually do have.
+ *  2. The case-insensitive pass exists because `isSkuTaken` enforces uniqueness
+ *     case-insensitively — without it, typing `abc-1` would fail to find a product
+ *     stored as `ABC-1` while still blocking that SKU from being created. QR scans hit
+ *     the exact path (the label carries the stored string); this only serves typing.
+ */
 export async function findProductByBarcode(shopId: string, raw: string): Promise<Product | undefined> {
   const code = raw.trim();
   if (!code) return undefined;
-  const bySku = await db.products.where('sku').equals(code).first();
-  if (bySku && bySku.shopId === shopId && !bySku.archived) return bySku;
+
+  const live = (p: Product | undefined): p is Product =>
+    !!p && p.shopId === shopId && !p.archived;
+
+  const bySku = (await db.products.where('sku').equals(code).toArray()).find(live);
+  if (bySku) return bySku;
+
   const byId = await db.products.where('id').equals(code).first();
-  if (byId && byId.shopId === shopId && !byId.archived) return byId;
-  return undefined;
+  if (live(byId)) return byId;
+
+  const wanted = normalizeSku(code);
+  const shopProducts = await db.products.where('shopId').equals(shopId).toArray();
+  return shopProducts.find((p) => !p.archived && normalizeSku(p.sku) === wanted);
+}
+
+/**
+ * Is this SKU already in use by a LIVE product of this shop?
+ *
+ * Archived products do NOT hold a SKU — archiving frees the code for reuse (the only
+ * cost is a stale shelf label, which is why `nextSkuFrom` still steps over archived
+ * numbers when *suggesting* one). Comparison is case-insensitive via `normalizeSku`.
+ */
+export async function isSkuTaken(shopId: string, sku: string, exceptProductId?: string): Promise<boolean> {
+  const wanted = normalizeSku(sku);
+  if (!wanted) return false;
+  const rows = await db.products.where('shopId').equals(shopId).toArray();
+  return rows.some((p) => !p.archived && p.id !== exceptProductId && normalizeSku(p.sku) === wanted);
+}
+
+/**
+ * The next free short numeric SKU for a shop — the default the New Product form opens
+ * with, so a product created through the UI never falls back to a 36-char UUID (which
+ * would be a dense, unreadable QR label: STEPS.md S1.2).
+ */
+export async function suggestNextSku(shopId: string): Promise<string> {
+  const rows = await db.products.where('shopId').equals(shopId).toArray();
+  return nextSkuFrom(rows.map((p) => p.sku));
 }
 
 export async function getProductCosting(productId: string): Promise<ProductCosting | undefined> {
@@ -41,6 +89,7 @@ export async function getLowStock(shopId: string): Promise<Product[]> {
 }
 
 export interface NewProductInput {
+  /** Required, unique per shop (case-insensitive) — this is what a QR label encodes. */
   sku: string;
   name: string;
   description?: string;
@@ -54,9 +103,17 @@ export interface NewProductInput {
 
 export async function createProduct(shopId: string, actorId: string, input: NewProductInput): Promise<Product> {
   const now = Date.now();
+  const sku = input.sku.trim();
+  // STEPS.md S1.2 — a blank SKU used to be auto-filled with `uid()`, which silently
+  // produced a 36-char UUID. That UUID is what the QR label would encode (a dense,
+  // unscannable pattern with no readable digits under it) and it is unusable as a
+  // shelf-visible code. Refuse instead of inventing one; the New Product form
+  // pre-fills a short suggestion, so a human only sees this if they clear the field.
+  if (!isValidSku(sku)) throw new Error(MISSING_SKU_MESSAGE);
+
   const product: Product = {
     id: uid(),
-    sku: input.sku.trim() || uid(),
+    sku,
     name: input.name.trim(),
     description: input.description?.trim() || undefined,
     category: input.category.trim() || 'General',
@@ -68,6 +125,12 @@ export async function createProduct(shopId: string, actorId: string, input: NewP
   };
 
   await db.transaction('rw', db.products, db.productCosting, db.stockLedger, db.outbox, async () => {
+    // STEPS.md S1.1 — SKU uniqueness per shop, INSIDE the transaction so two racing
+    // creates cannot both pass the check. Case-insensitive (`normalizeSku`); archived
+    // products do not hold their SKU. This is a correctness guard, not tidiness: the
+    // SKU is the QR payload, and a duplicate would make a scan sell the wrong product
+    // at the right price with a perfectly plausible receipt.
+    if (await isSkuTaken(shopId, sku)) throw new Error(duplicateSkuMessage(sku));
     await db.products.add(product);
     if (input.costPrice !== undefined) {
       const costing: ProductCosting = {

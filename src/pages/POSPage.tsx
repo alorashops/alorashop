@@ -6,12 +6,13 @@ import { useUiStore } from '../stores/uiStore';
 import { findProductByBarcode } from '../db/repos/products';
 import { createSale, confirmPayment, getSaleById } from '../db/repos/sales';
 import { searchCustomers, getCustomerById, isCreditAllowed } from '../db/repos/customers';
-import { attachProductScanHandler } from '../services/barcodeService';
+import { attachProductScanHandler, addProductToCart } from '../services/barcodeService';
 import { chargeCardOrPaystack } from '../services/paystack';
 import { verifyPayment } from '../services/paystackVerify';
 import { flushOutbox } from '../services/syncService';
 import { fmtMoney } from '../lib/utils';
 import { SkeletonTiles } from '../components/ui';
+import { QrScannerPanel } from '../components/QrScannerPanel';
 import type { Customer, PaymentMethod, PaymentStatus, Sale } from '../types';
 
 export default function POSPage() {
@@ -46,6 +47,8 @@ export default function POSPage() {
   /** True ONLY until the first catalogue read settles — the tile grid
       shimmers instead of flashing "No products match" during boot. */
   const [initialLoading, setInitialLoading] = useState(true);
+  /** Whether the inline camera scanner is open (STEPS.md D2 — no route, no POS copy). */
+  const [cameraOpen, setCameraOpen] = useState(false);
 
   const subtotal = cartSubtotal(cart.lines);
   const total = cartTotal(cart.lines, cart.discount);
@@ -94,6 +97,21 @@ export default function POSPage() {
     const stop = attachProductScanHandler((code) => findProductByBarcode(shopIdOf(), code));
     return stop;
   }, []);
+
+  /**
+   * Camera scan → resolve → cart (STEPS.md S3.4). Uses the SAME resolver as the wedge and the
+   * SAME `addProductToCart`. No stage gate (D4): the cart is still mutable on the pay stage.
+   * The success toast names the item so a scan is visible on either stage.
+   */
+  const handleCameraScan = async (code: string) => {
+    const product = await findProductByBarcode(shopIdOf(), code);
+    if (!product) {
+      toast.push('warn', `No product for code ${code}`);
+      return;
+    }
+    const result = addProductToCart(product);
+    if (result.status === 'added') toast.push('success', `Added ${product.name}`);
+  };
 
   const categories = useMemo(() => ['All', ...new Set(products.map((p) => p.category))], [products]);
   const visible = useMemo(() => {
@@ -470,7 +488,21 @@ export default function POSPage() {
                 <option key={c}>{c}</option>
               ))}
             </select>
+            <button
+              type="button"
+              className={`btn ${cameraOpen ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setCameraOpen((v) => !v)}
+              title="Scan a product QR with the camera"
+              style={{ flexShrink: 0 }}
+            >
+              📷 Scan
+            </button>
           </div>
+          {/* D2: the viewfinder expands below the sticky search row; the grid stays visible.
+              D4: the scan handler is NOT gated by stage — only this control lives on items. */}
+          {cameraOpen && (
+            <QrScannerPanel onScan={(code) => void handleCameraScan(code)} onClose={() => setCameraOpen(false)} />
+          )}
           {initialLoading ? (
             <SkeletonTiles count={8} />
           ) : (
@@ -482,16 +514,7 @@ export default function POSPage() {
                   key={p.id}
                   className="product-tile"
                   disabled={p.stockQuantity <= 0}
-                  onClick={() =>
-                    cart.add({
-                      productId: p.id,
-                      sku: p.sku,
-                      name: p.name,
-                      unitPrice: p.sellingPrice,
-                      quantity: 1,
-                      stockAvailable: p.stockQuantity
-                    })
-                  }
+                  onClick={() => addProductToCart(p)}
                 >
                   <div className="name">{p.name}</div>
                   <div className="price">{fmtMoney(p.sellingPrice)}</div>

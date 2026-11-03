@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuthStore, shopIdOf, canManageInventory, canSeeCosting } from '../stores/authStore';
 import { useInventoryStore } from '../stores/inventoryStore';
 import { useUiStore } from '../stores/uiStore';
-import { createProduct, updateProduct, restockProduct, deleteProduct } from '../db/repos/products';
+import { useShopStore } from '../stores/shopStore';
+import { createProduct, updateProduct, restockProduct, deleteProduct, suggestNextSku } from '../db/repos/products';
 import { Modal, EmptyState, SkeletonTable } from '../components/ui';
+import { ProductQrLabel } from '../components/ProductQrLabel';
+import { printQrLabels, LABEL_MAX_COPIES } from '../services/labelPrintService';
+import { qrLabelSize, qrLabelSizeLabel, DEFAULT_QR_LABEL_SIZE, type QrLabelSize } from '../lib/qr';
 import { fmtMoney, parseMoneyInput } from '../lib/utils';
 import type { Product } from '../types';
 
@@ -36,9 +40,38 @@ export default function InventoryPage() {
   /** True ONLY until the first refresh settles — the table shimmers instead
       of flashing "No products" while the first local read runs. */
   const [initialLoading, setInitialLoading] = useState(true);
+  /** Pre-filled SKU for the New Product form — the next free short numeric code for
+      this shop (STEPS.md S1.2). Blank until the suggestion loads; the input is keyed
+      on it so the async value still reaches an uncontrolled field. */
+  const [skuSuggestion, setSkuSuggestion] = useState('');
+  /** The product whose QR label modal is open (null = closed). */
+  const [qrProduct, setQrProduct] = useState<Product | null>(null);
+  /** Raw text for the label copy-count field (1–50). */
+  const [qrCopies, setQrCopies] = useState('1');
+  /** Chosen label size — sticky across opens so a manager printing a batch keeps their size. */
+  const [qrSize, setQrSize] = useState<QrLabelSize>(DEFAULT_QR_LABEL_SIZE);
+  /** Ref to the rendered label — the print service deep-clones this exact node, so the
+      preview on screen and the sheet on paper are the same DOM. */
+  const labelRef = useRef<HTMLDivElement>(null);
+  const shopName = useShopStore((s) => s.name);
 
   const manage = canManageInventory(user?.role);
   const seeCost = canSeeCosting(user?.role);
+
+  /**
+   * Open the print window for the label (STEPS.md S2.5). Called from a user gesture so the
+   * popup is allowed; a blocked popup returns false and is surfaced as a toast, never silent.
+   * Printing is manager/admin-only (D6): the QR action is unreachable for cashiers, and this
+   * guard is defence-in-depth in case the gating ever changes.
+   */
+  const handlePrintLabels = () => {
+    if (!manage || !qrProduct) return;
+    const n = Math.min(LABEL_MAX_COPIES, Math.max(1, Math.floor(Number(qrCopies) || 1)));
+    const ok = printQrLabels(labelRef.current, n, qrLabelSize(qrSize));
+    if (!ok) {
+      toast.push('error', 'Could not open the print window — allow pop-ups for this site and try again.');
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -64,6 +97,29 @@ export default function InventoryPage() {
     await refresh();
     if (seeCost) await loadCosting();
   };
+
+  /**
+   * New Product form: pre-fill the SKU with the shop's next free short numeric code.
+   * Keyed on `modal` so every open recomputes (and so a product just created advances
+   * the series). No counter is stored — the suggestion is derived from the SKUs that
+   * already exist, so nothing can drift.
+   */
+  useEffect(() => {
+    if (modal !== 'new') return;
+    let cancelled = false;
+    setSkuSuggestion('');
+    void (async () => {
+      try {
+        const next = await suggestNextSku(shopIdOf());
+        if (!cancelled) setSkuSuggestion(next);
+      } catch {
+        /* suggestion only — a blank field is still guarded server-side on submit */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [modal]);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -232,6 +288,9 @@ export default function InventoryPage() {
                     {manage && (
                       <td>
                         <div style={{ display: 'flex', gap: 6 }}>
+                          {/* D6: printing labels is manager/admin-only — this whole cell is
+                              inside `{manage && ...}`, so cashiers never reach the QR action. */}
+                          <button className="btn btn-sm btn-secondary" onClick={() => { setQrProduct(p); setQrCopies('1'); }}>QR</button>
                           <button className="btn btn-sm btn-secondary" onClick={() => openEdit(p)}>Edit</button>
                           <button className="btn btn-sm btn-success" onClick={() => { setRestockId(p.id); setRestockCost(''); }}>Restock</button>
                           <button
@@ -307,8 +366,22 @@ export default function InventoryPage() {
             <input className="input" name="min" type="number" defaultValue="0" />
           </div>
           <div className="field">
-            <label>Barcode / SKU (optional)</label>
-            <input className="input" name="sku" placeholder="Only if you use a barcode scanner" />
+            <label>SKU / barcode (printed on the QR label)</label>
+            {/* `key` forces a remount when the async suggestion lands — an uncontrolled
+                `defaultValue` is only applied on mount. */}
+            <input
+              className="input"
+              name="sku"
+              key={skuSuggestion}
+              defaultValue={skuSuggestion}
+              required
+              inputMode="numeric"
+              placeholder="e.g. 779011"
+            />
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+              Pre-filled with this shop's next free number — type your supplier's barcode instead if you have one.
+              It must be unique in this shop; the code under each printed QR is this value.
+            </div>
           </div>
           {seeCost && (
             <div className="field">
@@ -422,6 +495,54 @@ export default function InventoryPage() {
             <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
               <button className="btn btn-secondary" onClick={() => setRestockId(null)}>Cancel</button>
               <button className="btn btn-success" onClick={() => void doRestock(products.find((p) => p.id === restockId)!)}>Restock</button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* QR label modal — manager/admin only (D6). Nothing is written to the database: the
+          QR is derived from the SKU on the device (STEPS.md §1), so this is print-only. */}
+      <Modal open={qrProduct !== null} title={`QR label — ${qrProduct?.name ?? ''}`} onClose={() => setQrProduct(null)}>
+        {qrProduct && (
+          <div>
+            <div className="modal-sub">
+              Stick this on the shelf or the product. The code encodes the SKU, so a scanner sells the
+              exact item — and the digits under it can still be typed in if the label gets torn.
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'center', padding: 12, background: '#fff', borderRadius: 8 }}>
+              <ProductQrLabel ref={labelRef} shopName={shopName} name={qrProduct.name} sku={qrProduct.sku} size={qrSize} />
+            </div>
+            <div className="field" style={{ marginTop: 12 }}>
+              <label>Label size</label>
+              <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+                {(['small', 'large'] as const).map((s) => (
+                  <label key={s} style={{ display: 'flex', gap: 6, alignItems: 'center', fontWeight: 500 }}>
+                    <input type="radio" name="qrlabel-size" checked={qrSize === s} onChange={() => setQrSize(s)} />
+                    {qrLabelSizeLabel(s)}
+                    <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+                      {s === 'small' ? '(compact)' : '(large)'}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="field">
+              <label>Copies (1–{LABEL_MAX_COPIES})</label>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={LABEL_MAX_COPIES}
+                value={qrCopies}
+                onChange={(e) => setQrCopies(e.target.value)}
+              />
+            </div>
+            <p style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              Price is not printed — price changes never require a reprint.
+            </p>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => setQrProduct(null)}>Close</button>
+              <button className="btn btn-primary" onClick={handlePrintLabels}>Print</button>
             </div>
           </div>
         )}
