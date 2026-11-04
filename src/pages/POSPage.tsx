@@ -7,6 +7,7 @@ import { findProductByBarcode } from '../db/repos/products';
 import { createSale, confirmPayment, getSaleById } from '../db/repos/sales';
 import { searchCustomers, getCustomerById, isCreditAllowed } from '../db/repos/customers';
 import { attachProductScanHandler, addProductToCart } from '../services/barcodeService';
+import { unlockAudio, playScanError } from '../services/feedbackService';
 import { chargeCardOrPaystack } from '../services/paystack';
 import { verifyPayment } from '../services/paystackVerify';
 import { flushOutbox } from '../services/syncService';
@@ -98,15 +99,29 @@ export default function POSPage() {
     return stop;
   }, []);
 
+  // Arm the beep's AudioContext on the first gesture on this page (autoplay policy). Without
+  // this the very first scan — especially a USB wedge burst — could be silent.
+  useEffect(() => {
+    const unlock = () => unlockAudio();
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+  }, []);
+
   /**
    * Camera scan → resolve → cart (STEPS.md S3.4). Uses the SAME resolver as the wedge and the
    * SAME `addProductToCart`. No stage gate (D4): the cart is still mutable on the pay stage.
-   * The success toast names the item so a scan is visible on either stage.
+   * The success toast names the item so a scan is visible on either stage; the beep fires
+   * inside `addProductToCart`. A code with no product gets its own low buzz here.
    */
   const handleCameraScan = async (code: string) => {
     const product = await findProductByBarcode(shopIdOf(), code);
     if (!product) {
       toast.push('warn', `No product for code ${code}`);
+      playScanError();
       return;
     }
     const result = addProductToCart(product);

@@ -1,5 +1,6 @@
 import { useCartStore } from '../stores/cartStore';
 import { useUiStore } from '../stores/uiStore';
+import { playScanSuccess, playScanError } from './feedbackService';
 import type { Product } from '../types';
 
 /**
@@ -120,6 +121,7 @@ export function addProductToCart(product: Product): AddToCartResult {
 
   if (product.stockQuantity <= 0) {
     toast.push('error', `${product.name} is out of stock`);
+    playScanError();
     return { status: 'out-of-stock', quantity: 0, stockAvailable: 0 };
   }
 
@@ -129,6 +131,7 @@ export function addProductToCart(product: Product): AddToCartResult {
   // At or past the stock ceiling the add is a no-op — SAY SO instead of silence (B3).
   if (before >= product.stockQuantity) {
     toast.push('warn', `Only ${product.stockQuantity} in stock — ${product.name} is already at the limit`);
+    playScanError();
     return { status: 'max-stock', quantity: before, stockAvailable: product.stockQuantity };
   }
 
@@ -140,6 +143,8 @@ export function addProductToCart(product: Product): AddToCartResult {
     quantity: 1,
     stockAvailable: product.stockQuantity
   });
+  // Audible "got it" — the eyes-free confirmation that the item is IN the cart.
+  playScanSuccess();
   return { status: 'added', quantity: before + 1, stockAvailable: product.stockQuantity };
 }
 
@@ -152,6 +157,7 @@ export function attachProductScanHandler(lookup: (code: string) => Promise<Produ
     const product = await lookup(code);
     if (!product) {
       useUiStore.getState().push('warn', `No product for code ${code}`);
+      playScanError();
       return;
     }
     addProductToCart(product);
