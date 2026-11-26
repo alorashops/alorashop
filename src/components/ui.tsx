@@ -1,16 +1,18 @@
 import type { ReactNode } from 'react';
 
-export function Modal({ open, title, sub, onClose, children }: {
+export function Modal({ open, title, sub, onClose, children, wide = false }: {
   open: boolean;
   title: string;
   sub?: string;
   onClose: () => void;
   children: ReactNode;
+  /** Wider layout for data-dense modals (e.g. the analytics report). */
+  wide?: boolean;
 }) {
   if (!open) return null;
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className={`modal${wide ? ' modal-wide' : ''}`} onClick={(e) => e.stopPropagation()}>
         <h3>{title}</h3>
         {sub && <div className="modal-sub">{sub}</div>}
         {children}

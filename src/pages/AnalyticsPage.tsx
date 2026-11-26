@@ -2,8 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { useAuthStore, shopIdOf, canSeeCosting } from '../stores/authStore';
 import { useUiStore } from '../stores/uiStore';
 import { getSummariesRange, getTopSellingRange, backfillProfits, autoBackfillProfit, getStockValue, type TopSellingItem } from '../db/repos/summary';
-import { fmtMoneyCompact, todayKey, pct } from '../lib/utils';
+import { fmtMoneyCompact, todayKey, pct, isCloudShopId } from '../lib/utils';
 import { EmptyState, SkeletonCard, SkeletonStats } from '../components/ui';
+import ReportPreviewModal from '../components/ReportPreviewModal';
+import {
+  generateCloudReport,
+  downloadReportPdf,
+  ReportError,
+  type CloudReportResult
+} from '../services/report';
 import type { DailySummary } from '../types';
 
 /** YYYY-MM-DD for a day offset from today (negative = past). */
@@ -31,6 +38,15 @@ export default function AnalyticsPage() {
   const [initialLoading, setInitialLoading] = useState(true);
   /** In-flight indicator for the Refresh button only (never a skeleton). */
   const [loading, setLoading] = useState(false);
+  /** Cloud PDF report state. Manager/admin only (server enforces it too). */
+  const canReport = canSeeCosting(user?.role) && isCloudShopId(user?.shopId);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportData, setReportData] = useState<CloudReportResult | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  /** Monotonic report request id — an old slow response must never replace a
+      newer report, and a date change must invalidate an in-flight generation. */
+  const reportSeq = useRef(0);
 
   const load = async (from = fromDate, to = toDate) => {
     const seq = ++loadSeq.current;
@@ -100,6 +116,66 @@ export default function AnalyticsPage() {
     }
   };
 
+  /* ---------- cloud PDF report (manager/admin only) ---------- */
+  // A date change makes any open/in-flight report stale. Close it and invalidate
+  // the request id so a slow old response cannot reopen the old range.
+  useEffect(() => {
+    reportSeq.current += 1;
+    setReportOpen(false);
+    setReportData(null);
+    setReportLoading(false);
+  }, [fromDate, toDate]);
+
+  const openReport = async () => {
+    // Re-check the LIVE role at click time, not the render-time closure.
+    if (!canSeeCosting(useAuthStore.getState().user?.role)) {
+      toast.push('error', 'Only managers and admins can generate reports.');
+      return;
+    }
+    const seq = ++reportSeq.current;
+    setReportLoading(true);
+    try {
+      const result = await generateCloudReport(fromDate, toDate);
+      if (seq !== reportSeq.current) return; // dates changed / newer request
+      setReportData(result);
+      setReportOpen(true);
+      if (result.pendingSkipped > 0 || result.failedSkipped > 0) {
+        toast.push(
+          'warn',
+          `${result.pendingSkipped + result.failedSkipped} local record(s) are not in the cloud yet and are excluded from the report.`
+        );
+      }
+    } catch (err) {
+      if (seq !== reportSeq.current) return;
+      const message =
+        err instanceof ReportError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      toast.push('error', message);
+    } finally {
+      if (seq === reportSeq.current) setReportLoading(false);
+    }
+  };
+
+  const handleDownloadReport = () => {
+    if (!reportData) return;
+    if (!canSeeCosting(useAuthStore.getState().user?.role)) {
+      toast.push('error', 'Only managers and admins can download reports.');
+      return;
+    }
+    setDownloading(true);
+    try {
+      downloadReportPdf(reportData.pdfBase64, reportData.fileName);
+      toast.push('success', 'Report downloaded');
+    } catch (err) {
+      toast.push('error', err instanceof Error ? err.message : String(err));
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   /* ---------- range aggregates ---------- */
   const dayCount = summaries.length;
   const revenue = summaries.reduce((s, d) => s + d.totalRevenue, 0);
@@ -120,7 +196,17 @@ export default function AnalyticsPage() {
             Aggregates are derived from the synced sales ledger, so every device converges on the same numbers. Pick a date range.
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          {canReport && (
+            <button
+              className="btn btn-secondary"
+              onClick={() => void openReport()}
+              disabled={reportLoading}
+              title="Generate a PDF from cloud-synced data (manager/admin only; requires internet)"
+            >
+              {reportLoading ? 'Generating…' : '📄 Report'}
+            </button>
+          )}
           <button className="btn btn-secondary" onClick={() => void load()} disabled={loading}>
             {loading ? 'Loading…' : '↻ Refresh'}
           </button>
@@ -273,6 +359,14 @@ export default function AnalyticsPage() {
           </p>
         </div>
       )}
+
+      <ReportPreviewModal
+        open={reportOpen && canReport}
+        data={reportData}
+        onClose={() => setReportOpen(false)}
+        onDownload={handleDownloadReport}
+        downloading={downloading}
+      />
     </div>
   );
 }

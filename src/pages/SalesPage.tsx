@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { useAuthStore, shopIdOf, canManageInventory } from '../stores/authStore';
+import { shopIdOf } from '../stores/authStore';
 import { useUiStore } from '../stores/uiStore';
-import { getSalesPage, voidSale } from '../db/repos/sales';
+import { getSalesPage } from '../db/repos/sales';
 import { digitalReceipt, shareReceipt } from '../services/printService';
 import { fmtMoney, fmtDateTime } from '../lib/utils';
 import { EmptyState, MethodTag, SkeletonTable, StatusTag } from '../components/ui';
@@ -10,7 +10,6 @@ import type { Sale } from '../types';
 const PAGE_SIZE = 25;
 
 export default function SalesPage() {
-  const user = useAuthStore((s) => s.user);
   const toast = useUiStore();
   const [sales, setSales] = useState<Sale[]>([]);
   const [cursor, setCursor] = useState<number | undefined>();
@@ -19,7 +18,6 @@ export default function SalesPage() {
   /** True ONLY until the first read settles — drives the skeleton, so a
       manual refresh keeps the rows already on screen (no blink, no jump). */
   const [initialLoading, setInitialLoading] = useState(true);
-  const canVoid = canManageInventory(user?.role); // manager/admin approve voids
 
   const load = async (nextCursor?: number) => {
     setLoading(true);
@@ -49,31 +47,11 @@ export default function SalesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const doVoid = (sale: Sale) => {
-    if (sale.voidedBy) {
-      toast.push('warn', 'Already voided');
-      return;
-    }
-    toast.ask(
-      'Approve void?',
-      `Receipt ${sale.receiptNumber} — ${fmtMoney(sale.totalAmount)}. A reversal document is created; the original is never edited.`,
-      async () => {
-        try {
-          await voidSale(sale.id, user?.uid ?? 'mgr-1', 'Manager void approval');
-          toast.push('success', `Sale ${sale.receiptNumber} voided (reversal posted)`);
-          void load();
-        } catch (err) {
-          toast.push('error', err instanceof Error ? err.message : String(err));
-        }
-      }
-    );
-  };
-
   return (
     <div className="page">
       <h1 className="page-title">Sales History</h1>
       <p className="page-sub">
-        Paginated, cursor-based local reads. Financial records are append-only — voids create reversals, never edits.
+        Paginated, cursor-based local reads. Financial records are append-only; historical voided sales remain visible with a VOIDED tag.
       </p>
 
       <button className="btn btn-secondary" onClick={() => void load()} style={{ marginBottom: 14 }} disabled={loading}>
@@ -119,9 +97,6 @@ export default function SalesPage() {
                       <button className="btn btn-sm btn-secondary" onClick={() => toast.openReceipt(s.id)}>Receipt</button>
                       <button className="btn btn-sm btn-secondary" onClick={() => digitalReceipt(s)}>WhatsApp</button>
                       <button className="btn btn-sm btn-ghost" onClick={() => shareReceipt(s)}>Share</button>
-                      {canVoid && !s.voidedBy && (
-                        <button className="btn btn-sm btn-danger" onClick={() => doVoid(s)}>Void</button>
-                      )}
                     </div>
                   </td>
                 </tr>

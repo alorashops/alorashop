@@ -1,7 +1,7 @@
 
 import { db } from '../db';
 import { isCloudShopId, uid } from '../../lib/utils';
-import type { OutboxEntry, OutboxStatus, DailySummary, StockLedgerEntry, Sale } from '../../types';
+import type { OutboxEntry, OutboxStatus, DailySummary, StockLedgerEntry, Sale, Product } from '../../types';
 
 const DEVICE_KEY = 'alorashop_device_id';
 
@@ -236,6 +236,45 @@ export async function enqueueStockLedger(entry: StockLedgerEntry): Promise<void>
     idempotencyKey: `stock_ledger_${entry.id}`,
     entityType: 'RESTOCK', // all stock_ledger rows sync through this entity
     payload: entry,
+    status: 'PENDING',
+    retryCount: 0,
+    createdAt: Date.now()
+  });
+}
+
+/**
+ * Enqueue a product snapshot to the cloud mirror.
+ *
+ * WHY this exists: the PRODUCT doc is the ONLY row a device reads for
+ * `stockQuantity` (POS grid, Inventory table, low-stock badge). The append-only
+ * stock ledger is NOT applied to that field by `applyCloudChanges` — it is kept
+ * for audit only. So every stock mutation must push the product snapshot, or
+ * the change exists only on the device that made it.
+ *
+ * That was the "phone shows two low-stock items, PC shows none even after
+ * refresh" bug: Sale creation/voiding decremented/restored stock locally and
+ * wrote a ledger movement, but never enqueued the updated PRODUCT. Restock
+ * already did — this helper makes every path use the same propagation.
+ *
+ * A newer snapshot REPLACES any still-PENDING product entry for the same id
+ * (mirrors enqueueSale): the outbox must never hold two rows that map to the
+ * same cloud `id`, or one upsert chunk is rejected wholesale by Postgres
+ * ("ON CONFLICT DO UPDATE command cannot affect row a second time").
+ */
+export async function enqueueProduct(product: Product): Promise<void> {
+  if (!product || !isCloudShopId(product.shopId)) return;
+  const pending = await db.outbox.where('status').equals('PENDING').toArray();
+  for (const e of pending) {
+    const p = (e.payload ?? {}) as { id?: unknown };
+    if (e.entityType === 'PRODUCT' && p.id === product.id) {
+      await db.outbox.delete(e.id);
+    }
+  }
+  await db.outbox.add({
+    id: uid(),
+    idempotencyKey: `product_${product.id}`,
+    entityType: 'PRODUCT',
+    payload: product,
     status: 'PENDING',
     retryCount: 0,
     createdAt: Date.now()

@@ -2,7 +2,8 @@ import { db } from '../db';
 import { uid, todayKey, isCloudShopId } from '../../lib/utils';
 import { newIdempotencyKey } from '../../lib/idempotency';
 import { syncCreditBalanceCache } from './customers';
-import { enqueueDailySummary, enqueueStockLedger } from './outbox';
+import { enqueueDailySummary, enqueueProduct, enqueueStockLedger } from './outbox';
+import { reconcileProductStock } from './stock';
 import type { Sale, SaleItem, PaymentSplit, PaymentMethod, PaymentStatus, DailySummary } from '../../types';
 
 export interface CreateSaleInput {
@@ -73,8 +74,6 @@ export async function createSale(input: CreateSaleInput): Promise<Sale> {
     for (const [productId, delta] of stockDelta) {
       const product = await db.products.get(productId);
       if (!product) continue;
-      const nextQty = Math.max(0, product.stockQuantity + delta);
-      await db.products.put({ ...product, stockQuantity: nextQty, updatedAt: now });
       const ledgerEntry = {
         id: uid(),
         productId,
@@ -89,6 +88,26 @@ export async function createSale(input: CreateSaleInput): Promise<Sale> {
       // SALE movements are append-only and must reach the cloud — otherwise a
       // fresh device rebuilds a stock ledger missing every sale (Finding 3).
       await enqueueStockLedger(ledgerEntry);
+      // Reconcile from the ledger (opening + every movement) instead of doing
+      // snapshot arithmetic: the cached quantity on THIS device can be stale
+      // (a concurrent sale elsewhere), and the ledger sum is the same on every
+      // device. `delta` is this sale's own negative movement, applied to the
+      // snapshot for a product whose ledger has no opening row (legacy).
+      // Returns the corrected row with this sale's `updatedAt`, so the cloud
+      // row advances and other devices re-pull it.
+      const nextProduct =
+        (await reconcileProductStock(productId, now, delta)) ?? {
+          ...product,
+          stockQuantity: Math.max(0, product.stockQuantity + delta),
+          updatedAt: now
+        };
+      // The PRODUCT snapshot is what every device reads for `stockQuantity`
+      // (POS grid, Inventory table, low-stock badge); applyCloudChanges stores
+      // a pulled ledger movement for audit but never rewrites the product doc.
+      // Without this push, the stock drop existed ONLY on the selling device —
+      // the "phone shows low stock, PC shows none even after refresh" bug.
+      // Mirrors restockProduct, which has always pushed its updated snapshot.
+      await enqueueProduct(nextProduct);
     }
 
     // 3. Credit ledger entries for store-credit payments.
@@ -307,7 +326,13 @@ export async function getSalesByRange(shopId: string, from: number, to: number):
   return rows.sort((a, b) => b.createdAt - a.createdAt);
 }
 
-/** Void = reversal document, never an edit. Append-only enforced at repo level. */
+/**
+ * Void = reversal document, never an edit. Append-only enforced at repo level.
+ *
+ * UI ENTRY POINT REMOVED (owner request): the Sales page no longer renders a
+ * Void button. This function stays so historical reversals remain readable and
+ * the feature can be re-enabled without re-deriving the accounting rules.
+ */
 export async function voidSale(saleId: string, actorId: string, reason?: string): Promise<Sale> {
   const now = Date.now();
   const sale = await db.sales.get(saleId);
@@ -341,7 +366,6 @@ export async function voidSale(saleId: string, actorId: string, reason?: string)
     for (const [productId, delta] of deltaMap) {
       const product = await db.products.get(productId);
       if (!product) continue;
-      await db.products.put({ ...product, stockQuantity: Math.max(0, product.stockQuantity + delta), updatedAt: now });
       const ledgerEntry = {
         id: uid(),
         productId,
@@ -355,6 +379,17 @@ export async function voidSale(saleId: string, actorId: string, reason?: string)
       await db.stockLedger.add(ledgerEntry);
       // VOID movements are append-only and must reach the cloud too (Finding 3).
       await enqueueStockLedger(ledgerEntry);
+      // A voided sale restores stock — reconcile from the ledger and push the
+      // restored snapshot, exactly like a restock and a sale do. The ledger
+      // alone does not update other devices' product documents. `delta` is the
+      // restored (positive) movement for a legacy product with no opening row.
+      const nextProduct =
+        (await reconcileProductStock(productId, now, delta)) ?? {
+          ...product,
+          stockQuantity: Math.max(0, product.stockQuantity + delta),
+          updatedAt: now
+        };
+      await enqueueProduct(nextProduct);
     }
 
     // 2b. Credit reversal — a voided credit sale must also undo the customer's

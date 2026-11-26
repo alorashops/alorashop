@@ -16,9 +16,11 @@ import { useInventoryStore } from '../stores/inventoryStore';
 import { useAuthStore, shopIdOf, canSeeCosting } from '../stores/authStore';
 import { todayKey, isCloudShopId } from '../lib/utils';
 import { autoBackfillProfit } from '../db/repos/summary';
-import { buildCloudRows, upsertCloudRows, collapseDuplicates, pullCloudChanges, type PulledChange, type CloudRow } from './supabaseSync';
+import { buildCloudRows, upsertCloudRows, collapseDuplicates, pullCloudChanges, serverNowMs, type PulledChange, type CloudRow } from './supabaseSync';
+import { advanceCursor, legacyAdvanceCursor } from '../lib/syncCursor';
 import { verifyPayment } from './paystackVerify';
 import { confirmPayment } from '../db/repos/sales';
+import { reconcileShopStock } from '../db/repos/stock';
 
 /**
  * Background sync worker.
@@ -248,13 +250,27 @@ export async function pullDelta(): Promise<void> {
   pullRunning = true; // set before the first await so overlapping ticks bail
   try {
     const cursor = await getSyncCursor();
+    // The pull BOUNDARY is the SERVER clock sampled BEFORE any table is read.
+    // With `updated_at` server-assigned (migration 42), every row written after
+    // the boundary carries a strictly newer stamp and is guaranteed to be
+    // fetched next cycle, while every row written before it was necessarily
+    // visible to this pull's queries. Capping the cursor at the boundary stops a
+    // skewed device clock — or a row written to an already-drained table
+    // mid-pull — from stranding a row BELOW the watermark. That matters most for
+    // the append-only stock ledger: a movement skipped once is never re-pushed,
+    // so the derived stock would silently diverge per device. (syncCursor.ts.)
+    const boundary = await serverNowMs();
     const changes = await pullCloudChanges(cursor);
     const applied = await applyCloudChanges(changes);
-    // Cursor = the newest cloud updated_at we ACTUALLY applied in this pull,
-    // never the local wall clock. Rows we could not apply (missing id / unknown
-    // type) stay above the cursor so the next pull retries them instead of
-    // silently skipping them. Monotonic: never moves backwards.
-    const newest = applied.reduce((m, c) => Math.max(m, c.updatedAt), cursor);
+    // Rows we could NOT apply (missing id / unknown type) must stay STRICTLY
+    // above the cursor so the next pull retries them; `advanceCursor` lowers the
+    // cap for exactly those. When the server boundary is unavailable (migration
+    // 42 not applied) fall back to the legacy rule so an un-migrated shop keeps
+    // syncing. Monotonic either way — the watermark never moves backwards.
+    const appliedSet = new Set(applied);
+    const unapplied = changes.filter((c) => !appliedSet.has(c));
+    const newest =
+      boundary !== null ? advanceCursor(cursor, boundary, unapplied) : legacyAdvanceCursor(cursor, applied);
     await setSyncCursor(newest);
     await bumpQuota('reads', Math.max(1, changes.length));
     // Pull applied real rows -> refresh the UI-facing stores so newly synced
@@ -348,6 +364,11 @@ export async function repairPullTable(tableName: string): Promise<number> {
 /** Apply cloud rows locally; returns only the changes that were actually written. */
 async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[]> {
   const applied: PulledChange[] = [];
+  /** Set when a product snapshot / stock movement was applied, so ONE ledger
+      pass at the end refreshes every affected cache. Per-row reconciliation
+      would rescan the whole ledger for every product/movement — O(n²) on a
+      fresh device pulling thousands of rows. */
+  let stockTouched = false;
 
   // Strip sync-accounting metadata that must never be part of a canonical
   // local domain doc. buildCloudRows() injects `__idempotency_key` into the
@@ -428,6 +449,9 @@ async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[
         const key = String(payload.id);
         if (await keepLocalIfNotOlder((k) => db.products.get(k), key, payload)) break;
         await db.products.put(payload as never);
+        // Mark for the single end-of-pull ledger pass: a pulled snapshot may
+        // lag this device's own movements.
+        stockTouched = true;
         break;
       }
       case 'PRODUCT_COSTING': {
@@ -477,6 +501,10 @@ async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[
       case 'RESTOCK':
         // Append-only movements with unique ids — a plain idempotent put.
         await db.stockLedger.put(payload as never);
+        // One end-of-pull ledger pass refreshes the affected product caches
+        // (see `stockTouched`). This is what repairs a device that missed a
+        // sale, without waiting for a new sale on that item.
+        stockTouched = true;
         break;
       case 'DAILY_SUMMARY': {
         const key = String(payload.id);
@@ -498,6 +526,17 @@ async function applyCloudChanges(changes: PulledChange[]): Promise<PulledChange[
         continue; // unknown entity — leave above cursor for retry
     }
     applied.push(change);
+  }
+  // One ledger-derived refresh for the whole batch. Doing it per-row would
+  // rescan the entire ledger for every product/movement (O(n²) on a fresh
+  // device pulling thousands of rows). Best-effort: `getAllProducts` also
+  // reconciles on every inventory read, so a failure here is not fatal.
+  if (stockTouched) {
+    try {
+      await reconcileShopStock(shopIdOf());
+    } catch {
+      /* non-fatal — the read path converges on the next load */
+    }
   }
   return applied;
 }

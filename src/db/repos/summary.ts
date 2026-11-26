@@ -2,6 +2,7 @@
 import { db } from '../db';
 import { todayKey } from '../../lib/utils';
 import { enqueueDailySummary, enqueueSale } from './outbox';
+import { ledgerStockByProduct, stockFromLedger } from './stock';
 import { useAuthStore, canSeeCosting } from '../../stores/authStore';
 import type { DailySummary, ProductCosting, Sale, SaleItem } from '../../types';
 
@@ -288,13 +289,18 @@ export async function getStockValue(shopId: string): Promise<{ count: number; va
   // their leftover stock must not inflate "Stock on hand" on Analytics.
   // getLowStock/getAllProducts already filter archived; this one did not.
   const products = (await db.products.where('shopId').equals(shopId).toArray()).filter((p) => !p.archived);
+  // Stock value follows the same ledger-derived quantity the Inventory screen
+  // shows. Reading the cached snapshot here made Analytics disagree with the
+  // shelf count whenever one device had not yet received a product update.
+  const ledger = await ledgerStockByProduct(shopId);
   const costings = await db.productCosting.toArray();
   const costMap = new Map(costings.map((c) => [c.productId, c.weightedAverageCost ?? c.costPrice]));
   let value = 0;
   let count = 0;
   for (const p of products) {
-    count += p.stockQuantity;
-    value += p.stockQuantity * (costMap.get(p.id) ?? 0);
+    const qty = stockFromLedger(p, ledger);
+    count += qty;
+    value += qty * (costMap.get(p.id) ?? 0);
   }
   return { count, value };
 }

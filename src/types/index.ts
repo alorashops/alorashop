@@ -217,3 +217,6 @@ export interface AppUser {
   displayName: string;
   role: Role;
 }
+
+// Server-generated analytics report types (see src/types/report.ts).
+export * from './report';

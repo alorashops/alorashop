@@ -1,7 +1,8 @@
 import { db } from '../db';
 import { uid } from '../../lib/utils';
-import { enqueueStockLedger } from './outbox';
+import { enqueueProduct, enqueueStockLedger } from './outbox';
 import { applyWeightedAverageCost } from './summary';
+import { reconcileProductStock, reconcileShopStock } from './stock';
 import { isValidSku, nextSkuFrom, normalizeSku, duplicateSkuMessage, MISSING_SKU_MESSAGE } from '../../lib/sku';
 import type { Product, ProductCosting } from '../../types';
 
@@ -12,11 +13,11 @@ import type { Product, ProductCosting } from '../../types';
  */
 
 export async function getAllProducts(shopId: string): Promise<Product[]> {
-  return db.products
-    .where('shopId')
-    .equals(shopId)
-    .filter((p) => !p.archived)
-    .toArray();
+  // Read through the ledger-derived stock pass: a device whose product snapshot
+  // was never updated (or lost a concurrent-sale race) converges here from the
+  // append-only movements before POS/Inventory ever sees the row.
+  const products = await reconcileShopStock(shopId);
+  return products.filter((p) => !p.archived);
 }
 
 /**
@@ -81,11 +82,8 @@ export async function getProductCosting(productId: string): Promise<ProductCosti
 }
 
 export async function getLowStock(shopId: string): Promise<Product[]> {
-  return db.products
-    .where('shopId')
-    .equals(shopId)
-    .filter((p) => !p.archived && p.stockQuantity <= p.minStockLevel)
-    .toArray();
+  const products = await getAllProducts(shopId);
+  return products.filter((p) => p.stockQuantity <= p.minStockLevel);
 }
 
 export interface NewProductInput {
@@ -156,32 +154,28 @@ export async function createProduct(shopId: string, actorId: string, input: NewP
         createdAt: now
       });
     }
-    if (input.stockQuantity > 0) {
-      const ledgerEntry = {
-        id: uid(),
-        productId: product.id,
-        type: 'RESTOCK' as const,
-        quantityDelta: input.stockQuantity,
-        referenceId: product.id,
-        actorId,
-        shopId,
-        createdAt: now
-      };
-      await db.stockLedger.add(ledgerEntry);
-      // Opening RESTOCK row must reach the cloud too — previously only the
-      // PRODUCT row synced, so this product's stock origin was missing from
-      // every other device's audit trail (Finding 3).
-      await enqueueStockLedger(ledgerEntry);
-    }
-    await db.outbox.add({
+    // The OPENING row is ALWAYS written — even for zero starting stock. WHY:
+    // `hasOpening` (stockMath.ts) is the "this ledger is complete" signal that
+    // decides whether the on-hand number may be derived from the ledger. If a
+    // product's ledger ever holds movements without this baseline row, the sum
+    // is missing its start and would understate real stock — so every product
+    // created from here on carries its opening row (delta 0 when it starts
+    // empty). The row is enqueued so the baseline reaches every other device;
+    // previously only the PRODUCT row synced, so the origin was missing from
+    // every other device's ledger (Finding 3).
+    const ledgerEntry = {
       id: uid(),
-      idempotencyKey: `product_${product.id}`,
-      entityType: 'PRODUCT',
-      payload: product,
-      status: 'PENDING',
-      retryCount: 0,
+      productId: product.id,
+      type: 'RESTOCK' as const,
+      quantityDelta: product.stockQuantity,
+      referenceId: product.id,
+      actorId,
+      shopId,
       createdAt: now
-    });
+    };
+    await db.stockLedger.add(ledgerEntry);
+    await enqueueStockLedger(ledgerEntry);
+    await enqueueProduct(product);
   });
   return product;
 }
@@ -239,15 +233,8 @@ export async function updateProduct(productId: string, input: UpdateProductInput
         createdAt: now
       });
     }
-    await db.outbox.add({
-      id: uid(),
-      idempotencyKey: `product_${productId}`,
-      entityType: 'PRODUCT',
-      payload: next,
-      status: 'PENDING',
-      retryCount: 0,
-      createdAt: now
-    });
+    const reconciled = (await reconcileProductStock(productId, now)) ?? next;
+    await enqueueProduct(reconciled);
   });
 }
 
@@ -269,8 +256,7 @@ export async function restockProduct(
   await db.transaction('rw', db.products, db.productCosting, db.stockLedger, db.outbox, async () => {
     const product = await db.products.get(productId);
     if (!product) throw new Error('Product not found');
-    const next: Product = { ...product, stockQuantity: product.stockQuantity + qty, updatedAt: now };
-    await db.products.put(next);
+    const next: Product = { ...product, stockQuantity: Math.max(0, product.stockQuantity + qty), updatedAt: now };
     await db.stockLedger.add({
       id: restockId,
       productId,
@@ -318,15 +304,12 @@ export async function restockProduct(
           }
         }
         // Coalesce product doc flush too (stock change must reach the cloud).
-        await db.outbox.add({
-          id: uid(),
-          idempotencyKey: `product_${productId}`,
-          entityType: 'PRODUCT',
-          payload: next,
-          status: 'PENDING',
-          retryCount: 0,
-          createdAt: now
-        });
+        // Reconcile from the ledger first: it is authoritative when this
+        // product's ledger holds its opening row; otherwise the restock `qty`
+        // is applied to the snapshot (legacy product, no opening). The cached
+        // arithmetic above can start from a stale snapshot on this device.
+        const reconciled = (await reconcileProductStock(productId, now, qty)) ?? next;
+        await enqueueProduct(reconciled);
       });
     }
 
@@ -355,15 +338,7 @@ export async function deleteProduct(productId: string): Promise<{ archived: bool
     await db.products.put(next);
     // Always enqueue (even for no-history drafts) — the cloud must know, or a
     // fresh device (or erase + re-pull on this one) resurrects it as sellable.
-    await db.outbox.add({
-      id: uid(),
-      idempotencyKey: `product_${productId}_archive`,
-      entityType: 'PRODUCT',
-      payload: next,
-      status: 'PENDING',
-      retryCount: 0,
-      createdAt: now
-    });
+    await enqueueProduct(next);
   });
   return { archived: true };
 }

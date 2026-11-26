@@ -143,6 +143,30 @@ function getClient(): SupabaseClient {
 }
 
 /**
+ * The server wall clock in epoch ms — the delta-pull BOUNDARY.
+ *
+ * The pull cursor must never depend on a device clock (see
+ * `src/lib/syncCursor.ts`): a skewed clock can otherwise advance the watermark
+ * past rows that were never scanned, permanently stranding append-only ledger
+ * rows. Migration 42 makes the server own `updated_at` and exposes this RPC so
+ * the client can cap its cursor at the time the pull started.
+ *
+ * Returns `null` when the RPC is unavailable (migration not yet applied) so the
+ * caller degrades to the previous behaviour instead of breaking sync.
+ */
+export async function serverNowMs(): Promise<number | null> {
+  try {
+    const sb = getClient();
+    const { data, error } = await sb.rpc('server_now_ms');
+    if (error) throw error;
+    const n = Number(data);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Map pending outbox entries into upsertable cloud rows.
  *
  * Entries whose shop is NOT a real Supabase shop uuid (e.g. the offline demo
@@ -266,10 +290,11 @@ export function collapseDuplicates(rows: CloudRow[]): { unique: CloudRow[]; merg
 const PULL_PAGE_SIZE = 500;
 
 /**
- * Delta pull — every row in every sync table newer than the cursor.
+ * Delta pull — every row in every sync table at or newer than the cursor.
  *
  * Cursor 0 is a fresh device: there is no watermark yet, so we pull the whole
- * shop (gt 0 = every row) once and let the caller stamp the max applied value.
+ * shop (gte 0 = every row) once; the caller then caps the new cursor at the
+ * SERVER pull boundary (see src/lib/syncCursor.ts), never at a device clock.
  *
  * `onlyTable` (optional) restricts the pull to a single table from cursor 0 —
  * the targeted self-heal path (repairPullTable) that repairs an empty/drifted
@@ -298,10 +323,15 @@ export async function pullCloudChanges(cursor: number, onlyTable?: string): Prom
     // Draining until a short page is an explicit while(true) — a long-running
     // fresh-install sync is exactly the case where off-by-one loop bugs hide.
     while (true) {
+      // `gte` (not `gt`): the pull boundary is a server timestamp, and a row
+      // written in the SAME millisecond as the boundary would be missed by a
+      // strict `gt`. Re-reading the boundary instant is a near-zero extra cost
+      // (only rows stamped at exactly that ms) and re-applying rows is
+      // idempotent (upsert keyed on id; keepLocalIfNotOlder guards products).
       const { data, error } = await sb
         .from(readTarget)
         .select('data, updated_at')
-        .gt('updated_at', cursor)
+        .gte('updated_at', cursor)
         .order('updated_at', { ascending: true })
         .range(from, from + PULL_PAGE_SIZE - 1);
       if (error) throw error;

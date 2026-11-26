@@ -1,6 +1,5 @@
 import { create } from 'zustand';
-import { db } from '../db';
-import { getAllProducts, getProductCosting } from '../db/repos/products';
+import { getAllProducts, getLowStock, getProductCosting } from '../db/repos/products';
 import type { Product, ProductCosting } from '../types';
 import { shopIdOf } from './authStore';
 
@@ -43,12 +42,10 @@ export const useInventoryStore = create<InventoryState>((set) => ({
 /** Live low-stock listener (allowed: stock visibility during an active sale). */
 export function subscribeLowStock(cb: (count: number) => void): () => void {
   const run = async () => {
-    const shopId = shopIdOf();
-    const low = await db.products
-      .where('shopId')
-      .equals(shopId)
-      .filter((p) => !p.archived && p.stockQuantity <= p.minStockLevel)
-      .count();
+    // getLowStock reads through the ledger-derived stock pass (see stock.ts),
+    // so the badge can never disagree with the Inventory table on a device
+    // that is still catching up on product snapshots.
+    const low = (await getLowStock(shopIdOf())).length;
     cb(low);
   };
   void run();
